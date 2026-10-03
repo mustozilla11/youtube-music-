@@ -22,6 +22,16 @@ pub enum Tab {
     Favorites,
 }
 
+// ── Repeat Mode ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RepeatMode {
+    #[default]
+    Off, // Sıradan devam et (Default)
+    All, // Bütün listeyi tekrarla
+    One, // Bu şarkıyı tekrarla
+}
+
 // ── Config ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

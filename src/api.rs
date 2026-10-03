@@ -64,6 +64,7 @@ impl YtMusicClient {
     }
 
     /// Get automix/radio queue tracks starting from `video_id`.
+    /// Fetches up to ~100 tracks using continuation token.
     pub async fn get_radio_queue(&self, video_id: &str) -> Result<Vec<Track>> {
         let body = json!({
             "context": self.context(),
@@ -73,7 +74,44 @@ impl YtMusicClient {
             "isAudioOnly": true
         });
         let resp = self.post("next", body).await?;
-        Ok(parse_radio_queue(&resp))
+        let mut tracks = parse_radio_queue(&resp);
+
+        // Fetch continuation batch (second ~50 tracks)
+        let token = resp
+            .pointer(
+                "/contents/singleColumnMusicWatchNextResultsRenderer\
+                 /tabbedRenderer/watchNextTabbedResultsRenderer\
+                 /tabs/0/tabRenderer/content\
+                 /musicQueueRenderer/content\
+                 /playlistPanelRenderer/continuations/0\
+                 /nextRadioContinuationData/continuation",
+            )
+            .and_then(|v| v.as_str());
+
+        if let Some(tok) = token {
+            let cont_body = json!({
+                "context": self.context(),
+                "continuation": tok
+            });
+            if let Ok(cont_resp) = self.post("next", cont_body).await {
+                if let Some(items) = cont_resp
+                    .pointer("/continuationContents/playlistPanelContinuation/contents")
+                    .and_then(Value::as_array)
+                {
+                    for item in items {
+                        if let Some(r) = item.get("playlistPanelVideoRenderer") {
+                            if let Some(t) = parse_panel_video(r) {
+                                if !tracks.iter().any(|x| x.id == t.id) {
+                                    tracks.push(t);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(tracks)
     }
 
     /// Fetch the user's YouTube Music listen history (requires cookie auth).
