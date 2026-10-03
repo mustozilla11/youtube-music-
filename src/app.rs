@@ -808,32 +808,18 @@ impl YtMusicApp {
                         },
                     );
 
-                    // ── Right: Volume + percentage ───────────────────────────
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let pct = self.volume.round() as u32;
-                        ui.label(RichText::new(format!("%{pct}")).color(TEXT_D).size(12.0).monospace());
+                    // ── Center: Centered controls & Ultra-Wide Progress Bar ────
+                    let right_width = 150.0;
+                    let available_for_center = (ui.available_width() - right_width - 16.0).max(200.0);
 
-                        let r = ui.add_sized(
-                            [75.0, 18.0],
-                            egui::Slider::new(&mut self.volume, 0.0..=100.0).show_value(false),
-                        );
-                        if r.changed() {
-                            if let Some(p) = self.player.lock().unwrap().as_ref() {
-                                let _ = p.set_volume(self.volume);
-                            }
-                        }
-
-                        let v_icon = if self.volume == 0.0 { "🔇" } else if self.volume < 50.0 { "🔉" } else { "🔊" };
-                        ui.label(RichText::new(v_icon).size(13.0).color(TEXT_D));
-
-                        ui.add_space(8.0);
-
-                        // ── Center: Centered controls & Wide Progress Bar ────
-                        ui.vertical(|ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(available_for_center, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
                             // Centered controls row
                             ui.horizontal(|ui| {
                                 let ctrl_width = 175.0;
-                                let pad = (ui.available_width() - ctrl_width) / 2.0;
+                                let pad = (available_for_center - ctrl_width) / 2.0;
                                 ui.add_space(pad.max(0.0));
 
                                 // Previous
@@ -920,7 +906,7 @@ impl YtMusicApp {
 
                             ui.add_space(3.0);
 
-                            // Wide progress slider
+                            // Ultra-wide progress slider
                             ui.horizontal(|ui| {
                                 let display = if self.user_seeking { self.seek_target } else { self.position };
                                 ui.label(RichText::new(fmt_time(display)).color(TEXT_D).size(11.0).monospace());
@@ -929,16 +915,16 @@ impl YtMusicApp {
                                     ui.spacing_mut().slider_rail_height = 8.0;
 
                                     let vis = ui.visuals_mut();
-                                    vis.widgets.inactive.bg_fill   = Color32::from_rgb(55, 55, 55);
-                                    vis.widgets.hovered.bg_fill    = Color32::from_rgb(70, 70, 70);
-                                    vis.widgets.active.bg_fill     = Color32::from_rgb(85, 85, 85);
-                                    vis.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(75, 75, 75));
+                                    vis.widgets.inactive.bg_fill   = Color32::from_rgb(65, 65, 65);
+                                    vis.widgets.hovered.bg_fill    = Color32::from_rgb(85, 85, 85);
+                                    vis.widgets.active.bg_fill     = Color32::from_rgb(100, 100, 100);
+                                    vis.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(80, 80, 80));
 
                                     let mut t = if self.duration > 0.0 {
                                         (display / self.duration) as f32
                                     } else { 0.0 };
 
-                                    let slider_w = (ui.available_width() - 55.0).max(100.0);
+                                    let slider_w = (available_for_center - 90.0).max(120.0);
                                     let r = ui.add_sized(
                                         [slider_w, 20.0],
                                         egui::Slider::new(&mut t, 0.0..=1.0)
@@ -964,7 +950,26 @@ impl YtMusicApp {
 
                                 ui.label(RichText::new(fmt_time(self.duration)).color(TEXT_D).size(11.0).monospace());
                             });
-                        });
+                        },
+                    );
+
+                    // ── Right: Volume + percentage (docked to the right edge) ──
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let pct = self.volume.round() as u32;
+                        ui.label(RichText::new(format!("%{pct}")).color(TEXT_D).size(12.0).monospace());
+
+                        let r = ui.add_sized(
+                            [75.0, 18.0],
+                            egui::Slider::new(&mut self.volume, 0.0..=100.0).show_value(false),
+                        );
+                        if r.changed() {
+                            if let Some(p) = self.player.lock().unwrap().as_ref() {
+                                let _ = p.set_volume(self.volume);
+                            }
+                        }
+
+                        let v_icon = if self.volume == 0.0 { "🔇" } else if self.volume < 50.0 { "🔉" } else { "🔊" };
+                        ui.label(RichText::new(v_icon).size(13.0).color(TEXT_D));
                     });
                 });
             });
