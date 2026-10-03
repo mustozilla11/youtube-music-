@@ -17,6 +17,7 @@ pub struct Track {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tab {
     Search,
+    Queue,
     RecentlyPlayed,
     Favorites,
 }
@@ -35,9 +36,7 @@ pub enum WorkerMsg {
     Search(String),
     GetStreamUrl(Track),
     LoadImage(String),
-    /// Fetch automix/radio queue starting from this video id
     FetchRadio(String),
-    /// Fetch YouTube Music listen history (requires auth cookie)
     FetchYtHistory,
 }
 
@@ -51,10 +50,10 @@ pub enum AppResult {
         position: f64,
         duration: f64,
         paused: bool,
+        idle: bool,
+        eof: bool,
     },
-    /// Automix / radio tracks to append to the queue
     RadioQueue(Vec<Track>),
-    /// Tracks fetched from YouTube Music listen history
     YtHistory(Vec<Track>),
     Error(String),
 }

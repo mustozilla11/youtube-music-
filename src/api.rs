@@ -68,8 +68,9 @@ impl YtMusicClient {
         let body = json!({
             "context": self.context(),
             "videoId": video_id,
-            "isAudioOnly": true,
-            "tunerSettingValue": "AUTOMIX_SETTING_NORMAL"
+            "playlistId": format!("RDAMVM{video_id}"),
+            "params": "wAEB",
+            "isAudioOnly": true
         });
         let resp = self.post("next", body).await?;
         Ok(parse_radio_queue(&resp))
@@ -159,20 +160,22 @@ fn parse_radio_queue(json: &Value) -> Vec<Track> {
     let items = json
         .pointer(
             "/contents/singleColumnMusicWatchNextResultsRenderer\
-             /playlist/playlistPanelRenderer/contents",
+             /tabbedRenderer/watchNextTabbedResultsRenderer\
+             /tabs/0/tabRenderer/content\
+             /musicQueueRenderer/content\
+             /playlistPanelRenderer/contents",
         )
+        .or_else(|| {
+            json.pointer(
+                "/contents/singleColumnMusicWatchNextResultsRenderer\
+                 /playlist/playlistPanelRenderer/contents",
+            )
+        })
         .and_then(Value::as_array);
 
     if let Some(items) = items {
         for item in items {
             if let Some(r) = item.get("playlistPanelVideoRenderer") {
-                // Skip the currently selected (playing) track
-                if r.get("selected")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
                 if let Some(t) = parse_panel_video(r) {
                     tracks.push(t);
                 }

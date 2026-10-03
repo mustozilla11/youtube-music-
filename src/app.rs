@@ -40,7 +40,7 @@ pub struct YtMusicApp {
     history: Vec<Track>,
     favorites: Vec<Track>,
 
-    // Playback queue
+    // Playback queue (YouTube Music automix 50-track list)
     queue: Vec<Track>,
     queue_pos: usize,
     radio_fetched: bool,
@@ -52,9 +52,8 @@ pub struct YtMusicApp {
     duration: f64,
     volume: f64,
     loading_stream: bool,
-    prev_position: f64, // for end-of-track detection
 
-    // Seek UX: only send seek command on drag release
+    // Seek UX: update visually while dragging, seek mpv only on release
     user_seeking: bool,
     seek_target: f64,
 
@@ -148,6 +147,9 @@ impl YtMusicApp {
                                 Ok(tracks) if !tracks.is_empty() => {
                                     let _ = tx.send(AppResult::RadioQueue(tracks));
                                 }
+                                Err(e) => {
+                                    eprintln!("[ytmusic] radio queue hatası: {e}");
+                                }
                                 _ => {}
                             }
                         }
@@ -179,7 +181,6 @@ impl YtMusicApp {
             duration: 0.0,
             volume: 70.0,
             loading_stream: false,
-            prev_position: 0.0,
             user_seeking: false,
             seek_target: 0.0,
             polling: false,
@@ -222,12 +223,12 @@ impl YtMusicApp {
         v.code_bg_color    = SURF;
 
         let mk = |fill: Color32, fg: Color32, stroke_col: Color32| egui::style::WidgetVisuals {
-            bg_fill:     fill,
+            bg_fill:      fill,
             weak_bg_fill: fill,
-            bg_stroke:   Stroke::new(1.0_f32, stroke_col),
-            rounding:    Rounding::same(8.0),
-            fg_stroke:   Stroke::new(1.0_f32, fg),
-            expansion:   0.0,
+            bg_stroke:    Stroke::new(1.0_f32, stroke_col),
+            rounding:     Rounding::same(8.0),
+            fg_stroke:    Stroke::new(1.0_f32, fg),
+            expansion:    0.0,
         };
 
         v.widgets.noninteractive = mk(SURF,   TEXT,   BORDER);
@@ -267,18 +268,20 @@ impl YtMusicApp {
                                 self.history.truncate(50);
                                 self.storage.save_history(&self.history);
 
-                                self.current      = Some(track.clone());
-                                self.playing      = true;
-                                self.prev_position = 0.0;
-                                self.position     = 0.0;
+                                self.current  = Some(track.clone());
+                                self.playing  = true;
+                                self.position = 0.0;
 
-                                // Auto-fetch radio queue for this track
+                                // Auto-fetch YouTube Music automix/radio playlist
                                 if !self.radio_fetched {
                                     self.radio_fetched = true;
                                     let _ = self.cmd_tx.send(WorkerMsg::FetchRadio(track.id));
                                 }
                             }
-                            Err(e) => { drop(guard); self.toast(e.to_string()); }
+                            Err(e) => {
+                                drop(guard);
+                                self.toast(e.to_string());
+                            }
                         }
                     }
                 }
@@ -296,48 +299,44 @@ impl YtMusicApp {
                     }
                 }
 
-                AppResult::PlayerState { position, duration, paused } => {
+                AppResult::PlayerState { position, duration, paused, idle, eof } => {
                     self.polling = false;
 
-                    // End-of-track detection:
-                    // mpv becomes idle → time-pos returns null (→ 0) while duration also goes 0.
-                    // We detect this by noticing position dropped to near-zero after a real position.
+                    // Reliable end-of-track detection:
+                    // If mpv reached EOF or went back to idle while we were playing (and not currently loading a new track)
                     let track_ended = self.current.is_some()
-                        && self.prev_position > 20.0  // was significantly into the song
-                        && position < 2.0              // jumped back near zero
-                        && duration < 2.0              // duration also disappeared
-                        && !paused;                    // mpv not manually paused
-
-                    if position > 2.0 {
-                        self.prev_position = position;
-                    }
+                        && self.playing
+                        && !self.loading_stream
+                        && (eof || (idle && self.position > 3.0));
 
                     if !self.user_seeking {
                         self.position = position;
                         self.duration = duration;
                     } else {
-                        // While seeking, still update duration but keep slider position
                         self.duration = duration;
                     }
-                    self.playing = !paused;
+                    self.playing = !paused && !idle;
 
                     if track_ended {
-                        self.prev_position = 0.0;
                         self.auto_next();
                     }
                 }
 
                 AppResult::RadioQueue(tracks) => {
-                    // Append radio tracks that aren't already in the queue
-                    for t in tracks {
-                        if !self.queue.iter().any(|q| q.id == t.id) {
-                            self.queue.push(t);
+                    if !tracks.is_empty() {
+                        let cur_id = self.current.as_ref().map(|t| t.id.clone());
+                        self.queue = tracks;
+                        if let Some(id) = cur_id {
+                            self.queue_pos = self.queue.iter().position(|t| t.id == id).unwrap_or(0);
+                        } else {
+                            self.queue_pos = 0;
                         }
+                        let prefetch_list = self.queue.clone();
+                        self.prefetch_thumbs(&prefetch_list);
                     }
                 }
 
                 AppResult::YtHistory(tracks) => {
-                    // Merge YT history with local — YT history takes precedence
                     self.history = tracks;
                     self.storage.save_history(&self.history);
                 }
@@ -373,19 +372,27 @@ impl YtMusicApp {
             .ok()
             .flatten();
 
-            if let Some((pos, dur, paused)) = state {
-                let _ = tx.send(AppResult::PlayerState { position: pos, duration: dur, paused });
+            if let Some((pos, dur, paused, idle, eof)) = state {
+                let _ = tx.send(AppResult::PlayerState { position: pos, duration: dur, paused, idle, eof });
             } else {
-                // Socket unavailable — mark polling done
-                let _ = tx.send(AppResult::PlayerState { position: 0.0, duration: 0.0, paused: true });
+                let _ = tx.send(AppResult::PlayerState {
+                    position: 0.0,
+                    duration: 0.0,
+                    paused:   true,
+                    idle:     true,
+                    eof:      false,
+                });
             }
         });
     }
 
     // ── Queue / playback helpers ─────────────────────────────────────────────
 
-    /// Automatically advance to next track in queue (radio or manual next)
+    /// Automatically advance to the next track in the automix queue
     fn auto_next(&mut self) {
+        if self.loading_stream {
+            return;
+        }
         let next = self.queue_pos + 1;
         if next < self.queue.len() {
             self.queue_pos = next;
@@ -399,13 +406,12 @@ impl YtMusicApp {
     }
 
     fn prev_track(&mut self) {
-        // If more than 5 s in, restart current track; otherwise go to previous
+        // If > 5 seconds in, restart track; otherwise go to previous track in queue
         if self.position > 5.0 {
             if let Some(p) = self.player.lock().unwrap().as_ref() {
                 let _ = p.seek(0.0);
             }
-            self.position     = 0.0;
-            self.prev_position = 0.0;
+            self.position = 0.0;
         } else if self.queue_pos > 0 {
             self.queue_pos -= 1;
             let track = self.queue[self.queue_pos].clone();
@@ -414,19 +420,18 @@ impl YtMusicApp {
     }
 
     fn play_track(&mut self, track: Track) {
-        // Replace queue with just this track; radio will refill it
         self.queue.clear();
         self.queue.push(track.clone());
-        self.queue_pos    = 0;
+        self.queue_pos     = 0;
         self.radio_fetched = false;
         self.do_play(track);
     }
 
-    /// Internal: start loading the given track's stream without touching the queue
+    /// Internal: start loading the stream without resetting the queue
     fn do_play(&mut self, track: Track) {
         if self.loading_stream { return; }
         self.loading_stream = true;
-        self.prev_position  = 0.0;
+        self.position       = 0.0;
         if let Some(url) = &track.thumbnail_url { self.queue_img(url); }
         let _ = self.cmd_tx.send(WorkerMsg::GetStreamUrl(track));
     }
@@ -477,7 +482,7 @@ impl YtMusicApp {
             let app_title = format!("▶ YouTube Music v{}", env!("CARGO_PKG_VERSION"));
             ui.label(RichText::new(app_title).color(ACCENT).size(18.0).strong());
 
-            // Queue info (right side)
+            // Right side
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(14.0);
 
@@ -500,7 +505,7 @@ impl YtMusicApp {
                 if self.queue.len() > 1 {
                     ui.add_space(10.0);
                     ui.label(
-                        RichText::new(format!("Kuyruk: {} şarkı", self.queue.len()))
+                        RichText::new(format!("Kuyruk: {}/{}", self.queue_pos + 1, self.queue.len()))
                             .color(TEXT_M)
                             .size(11.5),
                     );
@@ -514,10 +519,17 @@ impl YtMusicApp {
             ui.set_min_height(42.0);
             ui.add_space(14.0);
 
+            let queue_label = if self.queue.len() > 1 {
+                format!("📻  Sıradaki ({})", self.queue.len())
+            } else {
+                "📻  Sıradaki".to_string()
+            };
+
             for (t, lbl) in [
-                (Tab::Search,         "🔍  Ara"),
-                (Tab::RecentlyPlayed, "🕐  Son Dinlenenler"),
-                (Tab::Favorites,      "❤  Favoriler"),
+                (Tab::Search,         "🔍  Ara".to_string()),
+                (Tab::Queue,          queue_label),
+                (Tab::RecentlyPlayed, "🕐  Son Dinlenenler".to_string()),
+                (Tab::Favorites,      "❤  Favoriler".to_string()),
             ] {
                 let active = self.tab == t;
                 let btn = egui::Button::new(
@@ -608,6 +620,60 @@ impl YtMusicApp {
         }
     }
 
+    fn ui_queue_tab(&mut self, ui: &mut egui::Ui) {
+        let queue = self.queue.clone();
+        self.prefetch_thumbs(&queue);
+
+        let textures  = self.textures.clone();
+        let favs      = self.favorites.clone();
+        let playing   = self.playing;
+        let queue_pos = self.queue_pos;
+        let mut actions: Vec<(usize, Track, RowAction)> = vec![];
+
+        egui::ScrollArea::vertical().id_source("queue_scroll").show(ui, |ui| {
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                ui.label(
+                    RichText::new(format!("📻 Sıradaki Şarkılar ({})", queue.len()))
+                        .color(TEXT)
+                        .size(18.0)
+                        .strong(),
+                );
+            });
+            ui.add_space(8.0);
+
+            if queue.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(50.0);
+                    ui.label(
+                        RichText::new("Henüz sıra boş. Bir şarkı başlattığında YouTube Music otomatik 50 şarkılık radyo oluşturacak!")
+                            .color(TEXT_M)
+                            .size(13.5),
+                    );
+                });
+                return;
+            }
+
+            for (idx, track) in queue.iter().enumerate() {
+                let is_cur = idx == queue_pos;
+                if let Some(a) = queue_row(ui, idx + 1, track, &textures, is_cur, &favs, playing) {
+                    actions.push((idx, track.clone(), a));
+                }
+            }
+        });
+
+        for (idx, track, a) in actions {
+            match a {
+                RowAction::Play => {
+                    self.queue_pos = idx;
+                    self.do_play(track);
+                }
+                RowAction::ToggleFav => self.toggle_fav(track),
+            }
+        }
+    }
+
     fn ui_list_tab(&mut self, ui: &mut egui::Ui, title: &str, is_favs: bool) {
         let source: Vec<Track> = if is_favs {
             self.favorites.clone()
@@ -660,11 +726,11 @@ impl YtMusicApp {
 
     fn ui_player_bar(&mut self, ui: &mut egui::Ui) {
         egui::Frame::none()
-            .fill(Color32::from_gray(4))
+            .fill(Color32::from_gray(6))
             .inner_margin(egui::Margin::symmetric(16.0, 10.0))
             .stroke(Stroke::new(1.0_f32, BORDER))
             .show(ui, |ui| {
-                ui.set_min_height(82.0);
+                ui.set_min_height(86.0);
 
                 if self.loading_stream {
                     ui.centered_and_justified(|ui| {
@@ -687,7 +753,7 @@ impl YtMusicApp {
                             let t = tex.clone();
                             ui.add(
                                 egui::Image::new(&t)
-                                    .fit_to_exact_size(Vec2::splat(56.0))
+                                    .fit_to_exact_size(Vec2::splat(58.0))
                                     .rounding(Rounding::same(6.0)),
                             );
                         }
@@ -700,41 +766,39 @@ impl YtMusicApp {
                         ui.label(RichText::new(&track.title).color(TEXT).size(13.5).strong());
                         ui.label(RichText::new(&track.artist).color(TEXT_D).size(11.0));
 
-                        // Queue position indicator
                         if self.queue.len() > 1 {
                             ui.label(
-                                RichText::new(format!(
-                                    "{} / {}",
-                                    self.queue_pos + 1,
-                                    self.queue.len()
-                                ))
-                                .color(TEXT_M)
-                                .size(10.0),
+                                RichText::new(format!("{} / {}", self.queue_pos + 1, self.queue.len()))
+                                    .color(TEXT_M)
+                                    .size(10.5),
                             );
                         }
                     });
 
                     ui.add_space(8.0);
 
-                    // ── Controls + progress ──────────────────────────────────
+                    // ── Controls & Progress Bar ──────────────────────────────
                     ui.vertical(|ui| {
-                        // ⏮ / ⏸▶ / ⏭
+                        // Controls: ⏮  ▶/⏸  ⏭
                         ui.horizontal(|ui| {
-                            let side_pad = (ui.available_width() - 116.0) / 2.0;
+                            let side_pad = (ui.available_width() - 130.0) / 2.0;
                             ui.add_space(side_pad.max(0.0));
 
                             // Previous
                             let prev_en = self.queue_pos > 0 || self.position > 5.0;
                             if ui.add_enabled(
                                 prev_en,
-                                egui::Button::new(RichText::new("⏮").size(16.0).color(if prev_en { TEXT } else { TEXT_M }))
-                                    .fill(Color32::TRANSPARENT)
-                                    .min_size(Vec2::splat(34.0)),
-                            ).clicked() {
+                                egui::Button::new(
+                                    RichText::new("⏮").size(16.0).color(if prev_en { TEXT } else { TEXT_M })
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .min_size(Vec2::new(34.0, 34.0)),
+                            ).on_hover_text("Önceki Şarkı")
+                            .clicked() {
                                 self.prev_track();
                             }
 
-                            ui.add_space(4.0);
+                            ui.add_space(6.0);
 
                             // Play / Pause
                             let icon = if self.playing { "⏸" } else { "▶" };
@@ -743,62 +807,77 @@ impl YtMusicApp {
                                     .fill(ACCENT)
                                     .rounding(Rounding::same(20.0))
                                     .min_size(Vec2::splat(40.0)),
-                            ).clicked() {
+                            ).on_hover_text("Oynat / Duraklat (Boşluk Tuşu)")
+                            .clicked() {
                                 if let Some(p) = self.player.lock().unwrap().as_ref() {
                                     let _ = p.toggle_pause();
                                     self.playing = !self.playing;
                                 }
                             }
 
-                            ui.add_space(4.0);
+                            ui.add_space(6.0);
 
                             // Next
                             let next_en = self.queue_pos + 1 < self.queue.len();
                             if ui.add_enabled(
                                 next_en,
-                                egui::Button::new(RichText::new("⏭").size(16.0).color(if next_en { TEXT } else { TEXT_M }))
-                                    .fill(Color32::TRANSPARENT)
-                                    .min_size(Vec2::splat(34.0)),
-                            ).clicked() {
+                                egui::Button::new(
+                                    RichText::new("⏭").size(16.0).color(if next_en { TEXT } else { TEXT_M })
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .min_size(Vec2::new(34.0, 34.0)),
+                            ).on_hover_text("Sonraki Şarkı")
+                            .clicked() {
                                 self.next_track();
                             }
                         });
 
                         ui.add_space(4.0);
 
-                        // Progress slider — seek only on drag release to avoid stream interruption
+                        // Progress slider: Thicker, clearly visible gray rail
                         ui.horizontal(|ui| {
                             let display = if self.user_seeking { self.seek_target } else { self.position };
-                            let mut t = if self.duration > 0.0 {
-                                (display / self.duration) as f32
-                            } else { 0.0 };
+                            ui.label(RichText::new(fmt_time(display)).color(TEXT_D).size(11.0).monospace());
 
-                            ui.label(RichText::new(fmt_time(display)).color(TEXT_M).size(10.0));
+                            ui.scope(|ui| {
+                                // 8px thick slider rail
+                                ui.spacing_mut().slider_rail_height = 8.0;
 
-                            let slider_w = (ui.available_width() - 68.0).max(40.0);
-                            let r = ui.add_sized(
-                                [slider_w, 20.0],
-                                egui::Slider::new(&mut t, 0.0..=1.0).show_value(false),
-                            );
+                                let vis = ui.visuals_mut();
+                                vis.widgets.inactive.bg_fill   = Color32::from_rgb(55, 55, 55);
+                                vis.widgets.hovered.bg_fill    = Color32::from_rgb(70, 70, 70);
+                                vis.widgets.active.bg_fill     = Color32::from_rgb(85, 85, 85);
+                                vis.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(75, 75, 75));
 
-                            // Update visual target while dragging
-                            if r.dragged() {
-                                self.user_seeking = true;
-                                self.seek_target  = t as f64 * self.duration;
-                            }
-                            // Commit seek only when finger/mouse is released
-                            if r.drag_stopped() {
-                                self.user_seeking = false;
-                                if self.duration > 0.0 {
-                                    let target = t as f64 * self.duration;
-                                    if let Some(p) = self.player.lock().unwrap().as_ref() {
-                                        let _ = p.seek(target);
-                                    }
-                                    self.position = target;
+                                let mut t = if self.duration > 0.0 {
+                                    (display / self.duration) as f32
+                                } else { 0.0 };
+
+                                let slider_w = (ui.available_width() - 65.0).max(100.0);
+                                let r = ui.add_sized(
+                                    [slider_w, 20.0],
+                                    egui::Slider::new(&mut t, 0.0..=1.0)
+                                        .show_value(false)
+                                        .trailing_fill(true),
+                                );
+
+                                if r.dragged() {
+                                    self.user_seeking = true;
+                                    self.seek_target  = t as f64 * self.duration;
                                 }
-                            }
+                                if r.drag_stopped() {
+                                    self.user_seeking = false;
+                                    if self.duration > 0.0 {
+                                        let target = t as f64 * self.duration;
+                                        if let Some(p) = self.player.lock().unwrap().as_ref() {
+                                            let _ = p.seek(target);
+                                        }
+                                        self.position = target;
+                                    }
+                                }
+                            });
 
-                            ui.label(RichText::new(fmt_time(self.duration)).color(TEXT_M).size(10.0));
+                            ui.label(RichText::new(fmt_time(self.duration)).color(TEXT_D).size(11.0).monospace());
                         });
                     });
 
@@ -1007,6 +1086,110 @@ fn track_row(
     action
 }
 
+/// Queue track row showing track index number and active playing state
+fn queue_row(
+    ui: &mut egui::Ui,
+    index: usize,
+    track: &Track,
+    textures: &HashMap<String, egui::TextureHandle>,
+    is_cur: bool,
+    favs: &[Track],
+    playing: bool,
+) -> Option<RowAction> {
+    let is_fav = favs.iter().any(|t| t.id == track.id);
+    let mut action = None;
+
+    let bg = if is_cur {
+        Color32::from_rgba_premultiplied(255, 0, 48, 25)
+    } else {
+        SURF
+    };
+
+    egui::Frame::none()
+        .fill(bg)
+        .rounding(Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+        .outer_margin(egui::Margin { left: 14.0, right: 14.0, top: 0.0, bottom: 4.0 })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Index number or playing icon
+                if is_cur {
+                    ui.label(RichText::new(if playing { "▶" } else { "⏸" }).color(ACCENT).size(13.0).strong());
+                } else {
+                    ui.label(RichText::new(format!("{index}")).color(TEXT_M).size(12.0).monospace());
+                }
+                ui.add_space(6.0);
+
+                let sz = Vec2::splat(42.0);
+                if let Some(url) = &track.thumbnail_url {
+                    if let Some(tex) = textures.get(url) {
+                        ui.add(
+                            egui::Image::new(tex)
+                                .fit_to_exact_size(sz)
+                                .rounding(Rounding::same(4.0)),
+                        );
+                    } else {
+                        thumb_placeholder(ui, sz);
+                    }
+                } else {
+                    thumb_placeholder(ui, sz);
+                }
+
+                ui.add_space(8.0);
+
+                ui.vertical(|ui| {
+                    ui.set_min_width(150.0);
+                    ui.label(
+                        RichText::new(&track.title)
+                            .color(if is_cur { ACCENT } else { TEXT })
+                            .size(13.5)
+                            .strong(),
+                    );
+                    ui.label(RichText::new(&track.artist).color(TEXT_D).size(11.0));
+                });
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let pi = if is_cur && playing { "⏸" } else { "▶" };
+                    if ui.add(
+                        egui::Button::new(RichText::new(pi).size(14.0).color(TEXT))
+                            .fill(if is_cur { ACCENT2 } else { SURF2 })
+                            .rounding(Rounding::same(6.0))
+                            .min_size(Vec2::splat(30.0)),
+                    ).clicked() {
+                        action = Some(RowAction::Play);
+                    }
+
+                    ui.add_space(4.0);
+
+                    if ui.add(
+                        egui::Button::new(
+                            RichText::new(if is_fav { "❤" } else { "♡" })
+                                .color(if is_fav { ACCENT } else { TEXT_M })
+                                .size(15.0),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE)
+                        .min_size(Vec2::splat(30.0)),
+                    ).clicked() {
+                        action = Some(RowAction::ToggleFav);
+                    }
+
+                    ui.add_space(4.0);
+
+                    if let Some(s) = track.duration_secs {
+                        ui.label(
+                            RichText::new(format!("{}:{:02}", s / 60, s % 60))
+                                .color(TEXT_M)
+                                .size(11.0),
+                        );
+                    }
+                });
+            });
+        });
+
+    action
+}
+
 fn thumb_placeholder(ui: &mut egui::Ui, size: Vec2) {
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     ui.painter().rect_filled(rect, Rounding::same(4.0), SURF2);
@@ -1028,11 +1211,19 @@ impl eframe::App for YtMusicApp {
         self.drain(ctx);
         self.poll_player();
 
+        // Spacebar toggles playback (unless user is typing in a search text box)
+        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            if let Some(p) = self.player.lock().unwrap().as_ref() {
+                let _ = p.toggle_pause();
+                self.playing = !self.playing;
+            }
+        }
+
         if self.error.is_some() && Instant::now() > self.error_end {
             self.error = None;
         }
 
-        // Keep repainting while playing for the progress bar
+        // Keep repainting while playing for progress bar smoothness
         if self.playing {
             ctx.request_repaint_after(Duration::from_millis(600));
         }
@@ -1068,12 +1259,11 @@ impl eframe::App for YtMusicApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(BG))
             .show(ctx, |ui| {
-                if self.tab == Tab::Search {
-                    self.ui_search_tab(ui);
-                } else if self.tab == Tab::RecentlyPlayed {
-                    self.ui_list_tab(ui, "Son Dinlenenler", false);
-                } else {
-                    self.ui_list_tab(ui, "Favoriler", true);
+                match self.tab {
+                    Tab::Search         => self.ui_search_tab(ui),
+                    Tab::Queue          => self.ui_queue_tab(ui),
+                    Tab::RecentlyPlayed => self.ui_list_tab(ui, "Son Dinlenenler", false),
+                    Tab::Favorites      => self.ui_list_tab(ui, "Favoriler", true),
                 }
             });
 

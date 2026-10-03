@@ -104,13 +104,18 @@ impl Player {
             .unwrap_or(true)
     }
 
-    /// Returns (position_secs, duration_secs, is_paused).
-    pub fn get_state(&self) -> (f64, f64, bool) {
-        (
-            self.get_f64("time-pos"),
-            self.get_f64("duration"),
-            self.get_bool("pause"),
-        )
+    /// Returns (position_secs, duration_secs, is_paused, is_idle, is_eof).
+    pub fn get_state(&self) -> (f64, f64, bool, bool, bool) {
+        let pos = self.get_f64("time-pos");
+        let dur = self.get_f64("duration");
+        let pause = self.get_bool("pause");
+        let idle = self.get_bool("idle-active");
+        let eof = self.cmd(json!({"command": ["get_property", "eof-reached"]}))
+            .ok()
+            .and_then(|v| v["data"].as_bool())
+            .unwrap_or(false);
+
+        (pos, dur, pause, idle, eof)
     }
 }
 
