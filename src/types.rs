@@ -35,6 +35,10 @@ pub enum WorkerMsg {
     Search(String),
     GetStreamUrl(Track),
     LoadImage(String),
+    /// Fetch automix/radio queue starting from this video id
+    FetchRadio(String),
+    /// Fetch YouTube Music listen history (requires auth cookie)
+    FetchYtHistory,
 }
 
 // ── App results (background → UI) ────────────────────────────────────────────
@@ -48,5 +52,9 @@ pub enum AppResult {
         duration: f64,
         paused: bool,
     },
+    /// Automix / radio tracks to append to the queue
+    RadioQueue(Vec<Track>),
+    /// Tracks fetched from YouTube Music listen history
+    YtHistory(Vec<Track>),
     Error(String),
 }

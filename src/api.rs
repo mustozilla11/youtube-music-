@@ -50,21 +50,47 @@ impl YtMusicClient {
         Ok(resp)
     }
 
+    // ── Public API ────────────────────────────────────────────────────────────
+
     /// Search YouTube Music for tracks matching `query`.
     pub async fn search(&self, query: &str) -> Result<Vec<Track>> {
-        // params = base64 filter for "Songs" type
         let body = json!({
             "context": self.context(),
             "query": query,
             "params": "EgWKAQIIAWoKEAkQBRAKEAMQBA=="
         });
         let resp = self.post("search", body).await?;
-        Ok(parse_results(&resp))
+        Ok(parse_search_results(&resp))
+    }
+
+    /// Get automix/radio queue tracks starting from `video_id`.
+    pub async fn get_radio_queue(&self, video_id: &str) -> Result<Vec<Track>> {
+        let body = json!({
+            "context": self.context(),
+            "videoId": video_id,
+            "isAudioOnly": true,
+            "tunerSettingValue": "AUTOMIX_SETTING_NORMAL"
+        });
+        let resp = self.post("next", body).await?;
+        Ok(parse_radio_queue(&resp))
+    }
+
+    /// Fetch the user's YouTube Music listen history (requires cookie auth).
+    pub async fn get_yt_history(&self) -> Result<Vec<Track>> {
+        if self.cookie.is_none() {
+            return Ok(vec![]);
+        }
+        let body = json!({
+            "context": self.context(),
+            "browseId": "FEmusic_history"
+        });
+        let resp = self.post("browse", body).await?;
+        Ok(parse_browse_tracks(&resp))
     }
 
     /// Obtain a direct audio stream URL via yt-dlp.
+    /// Prefers WebM/Opus (up to 251 kbps) over AAC for better quality.
     pub async fn get_stream_url(id: &str) -> Result<String> {
-        // Make sure yt-dlp is available
         let chk = tokio::process::Command::new("which")
             .arg("yt-dlp")
             .output()
@@ -76,8 +102,9 @@ impl YtMusicClient {
         let out = tokio::process::Command::new("yt-dlp")
             .args([
                 "-g",
+                // Prefer Opus/WebM (251 kbps) > AAC/M4A > anything else
                 "-f",
-                "bestaudio",
+                "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio",
                 "--no-playlist",
                 "--quiet",
                 &format!("https://music.youtube.com/watch?v={id}"),
@@ -93,9 +120,10 @@ impl YtMusicClient {
     }
 }
 
-// ── Response parsing ──────────────────────────────────────────────────────────
+// ── JSON parsers ──────────────────────────────────────────────────────────────
 
-fn parse_results(json: &Value) -> Vec<Track> {
+/// Parse results from `/youtubei/v1/search`
+fn parse_search_results(json: &Value) -> Vec<Track> {
     let mut tracks = Vec::new();
 
     let sections = json
@@ -113,7 +141,7 @@ fn parse_results(json: &Value) -> Vec<Track> {
                 .and_then(Value::as_array)
             {
                 for item in items {
-                    if let Some(t) = parse_track(item) {
+                    if let Some(t) = parse_responsive_item(item) {
                         tracks.push(t);
                     }
                 }
@@ -124,19 +152,73 @@ fn parse_results(json: &Value) -> Vec<Track> {
     tracks
 }
 
-fn first_run_text(v: &Value) -> Option<String> {
-    v.get("runs")?
-        .as_array()?
-        .first()?
-        .get("text")?
-        .as_str()
-        .map(String::from)
+/// Parse radio/automix queue from `/youtubei/v1/next`
+fn parse_radio_queue(json: &Value) -> Vec<Track> {
+    let mut tracks = Vec::new();
+
+    let items = json
+        .pointer(
+            "/contents/singleColumnMusicWatchNextResultsRenderer\
+             /playlist/playlistPanelRenderer/contents",
+        )
+        .and_then(Value::as_array);
+
+    if let Some(items) = items {
+        for item in items {
+            if let Some(r) = item.get("playlistPanelVideoRenderer") {
+                // Skip the currently selected (playing) track
+                if r.get("selected")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                if let Some(t) = parse_panel_video(r) {
+                    tracks.push(t);
+                }
+            }
+        }
+    }
+
+    tracks
 }
 
-fn parse_track(item: &Value) -> Option<Track> {
+/// Parse browse results (history, liked songs, etc.) from `/youtubei/v1/browse`
+fn parse_browse_tracks(json: &Value) -> Vec<Track> {
+    let mut tracks = Vec::new();
+
+    let sections = json
+        .pointer(
+            "/contents/singleColumnBrowseResultsRenderer\
+             /tabs/0/tabRenderer/content\
+             /sectionListRenderer/contents",
+        )
+        .and_then(Value::as_array);
+
+    if let Some(secs) = sections {
+        for sec in secs {
+            if let Some(items) = sec
+                .pointer("/musicShelfRenderer/contents")
+                .and_then(Value::as_array)
+            {
+                for item in items {
+                    if let Some(t) = parse_responsive_item(item) {
+                        tracks.push(t);
+                    }
+                }
+            }
+        }
+    }
+
+    tracks
+}
+
+// ── Item-level parsers ────────────────────────────────────────────────────────
+
+/// Parse a `musicResponsiveListItemRenderer` (search / history rows)
+fn parse_responsive_item(item: &Value) -> Option<Track> {
     let r = item.get("musicResponsiveListItemRenderer")?;
 
-    // video id — try play-button overlay first, then title navigation
     let id = r
         .pointer(
             "/overlay/musicItemThumbnailOverlayRenderer\
@@ -153,7 +235,6 @@ fn parse_track(item: &Value) -> Option<Track> {
         .and_then(|v| v.as_str())
         .map(String::from)?;
 
-    // title
     let title = r
         .pointer(
             "/flexColumns/0\
@@ -161,7 +242,6 @@ fn parse_track(item: &Value) -> Option<Track> {
         )
         .and_then(first_run_text)?;
 
-    // second flex column = artist [• type • album • year]
     let runs = r
         .pointer(
             "/flexColumns/1\
@@ -176,14 +256,12 @@ fn parse_track(item: &Value) -> Option<Track> {
         .map(String::from)
         .unwrap_or_else(|| "Bilinmiyor".into());
 
-    // album is usually the 5th run token (index 4)
     let album = runs
         .and_then(|r| r.get(4))
         .and_then(|r| r.get("text"))
         .and_then(|t| t.as_str())
         .map(String::from);
 
-    // duration from fixed columns
     let duration_secs = r
         .pointer(
             "/fixedColumns/0\
@@ -193,32 +271,76 @@ fn parse_track(item: &Value) -> Option<Track> {
         .and_then(|v| v.as_str())
         .and_then(parse_duration);
 
-    // thumbnail — highest resolution available
     let thumbnail_url = r
-        .pointer(
-            "/thumbnail/musicThumbnailRenderer\
-             /thumbnail/thumbnails",
-        )
+        .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
         .and_then(Value::as_array)
         .and_then(|a| a.last())
         .and_then(|t| t.get("url"))
         .and_then(|u| u.as_str())
-        .map(|u| {
-            if u.starts_with("//") {
-                format!("https:{u}")
-            } else {
-                u.to_owned()
-            }
-        });
+        .map(fix_url);
 
-    Some(Track {
-        id,
-        title,
-        artist,
-        album,
-        duration_secs,
-        thumbnail_url,
-    })
+    Some(Track { id, title, artist, album, duration_secs, thumbnail_url })
+}
+
+/// Parse a `playlistPanelVideoRenderer` (radio/queue rows)
+fn parse_panel_video(r: &Value) -> Option<Track> {
+    let id = r.get("videoId")?.as_str().map(String::from)?;
+
+    let title = r
+        .pointer("/title/runs/0/text")
+        .and_then(|v| v.as_str())
+        .map(String::from)?;
+
+    let runs = r
+        .pointer("/longBylineText/runs")
+        .and_then(Value::as_array);
+
+    let artist = runs
+        .and_then(|r| r.first())
+        .and_then(|r| r.get("text"))
+        .and_then(|t| t.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| "Bilinmiyor".into());
+
+    let album = runs
+        .and_then(|r| r.get(2))
+        .and_then(|r| r.get("text"))
+        .and_then(|t| t.as_str())
+        .map(String::from);
+
+    let duration_secs = r
+        .pointer("/lengthText/runs/0/text")
+        .and_then(|v| v.as_str())
+        .and_then(parse_duration);
+
+    let thumbnail_url = r
+        .pointer("/thumbnail/thumbnails")
+        .and_then(Value::as_array)
+        .and_then(|a| a.last())
+        .and_then(|t| t.get("url"))
+        .and_then(|u| u.as_str())
+        .map(fix_url);
+
+    Some(Track { id, title, artist, album, duration_secs, thumbnail_url })
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+fn first_run_text(v: &Value) -> Option<String> {
+    v.get("runs")?
+        .as_array()?
+        .first()?
+        .get("text")?
+        .as_str()
+        .map(String::from)
+}
+
+fn fix_url(u: &str) -> String {
+    if u.starts_with("//") {
+        format!("https:{u}")
+    } else {
+        u.to_owned()
+    }
 }
 
 fn parse_duration(s: &str) -> Option<u32> {
