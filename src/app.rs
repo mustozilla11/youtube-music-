@@ -937,43 +937,29 @@ impl YtMusicApp {
                     let display = if self.user_seeking { self.seek_target } else { self.position };
                     ui.label(RichText::new(fmt_time(display)).color(TEXT_D).size(11.0).monospace());
 
-                    ui.scope(|ui| {
-                        ui.spacing_mut().slider_rail_height = 8.0;
+                    let progress = if self.duration > 0.0 {
+                        (display / self.duration) as f32
+                    } else {
+                        0.0
+                    };
 
-                        let vis = ui.visuals_mut();
-                        vis.widgets.inactive.bg_fill   = Color32::from_rgb(65, 65, 65);
-                        vis.widgets.hovered.bg_fill    = Color32::from_rgb(85, 85, 85);
-                        vis.widgets.active.bg_fill     = Color32::from_rgb(100, 100, 100);
-                        vis.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(80, 80, 80));
+                    let slider_w = (total_w - 95.0).max(120.0);
+                    let (is_dragged, is_drag_stopped, new_val) = draw_seek_bar(ui, progress, slider_w);
 
-                        let mut t = if self.duration > 0.0 {
-                            (display / self.duration) as f32
-                        } else { 0.0 };
-
-                        // total_w minus the two time labels and item spacing
-                        let slider_w = (total_w - 100.0).max(120.0);
-                        let r = ui.add_sized(
-                            [slider_w, 22.0],
-                            egui::Slider::new(&mut t, 0.0..=1.0)
-                                .show_value(false)
-                                .trailing_fill(true),
-                        );
-
-                        if r.dragged() {
-                            self.user_seeking = true;
-                            self.seek_target  = t as f64 * self.duration;
-                        }
-                        if r.drag_stopped() {
-                            self.user_seeking = false;
-                            if self.duration > 0.0 {
-                                let target = t as f64 * self.duration;
-                                if let Some(p) = self.player.lock().unwrap().as_ref() {
-                                    let _ = p.seek(target);
-                                }
-                                self.position = target;
+                    if is_dragged {
+                        self.user_seeking = true;
+                        self.seek_target  = new_val as f64 * self.duration;
+                    }
+                    if is_drag_stopped {
+                        self.user_seeking = false;
+                        if self.duration > 0.0 {
+                            let target = new_val as f64 * self.duration;
+                            if let Some(p) = self.player.lock().unwrap().as_ref() {
+                                let _ = p.seek(target);
                             }
+                            self.position = target;
                         }
-                    });
+                    }
 
                     ui.label(RichText::new(fmt_time(self.duration)).color(TEXT_D).size(11.0).monospace());
                 });
@@ -1265,6 +1251,67 @@ fn queue_row(
         });
 
     action
+}
+
+/// Custom seek bar that guarantees 100% full-width gray rail, smooth hover, and click/drag seeking
+fn draw_seek_bar(
+    ui: &mut egui::Ui,
+    current_progress: f32, // 0.0..=1.0
+    width: f32,
+) -> (bool, bool, f32) {
+    let desired_size = Vec2::new(width, 22.0);
+    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
+
+    let is_hovered = response.hovered();
+    let is_dragged = response.dragged();
+    let is_drag_stopped = response.drag_stopped() || (response.clicked() && !is_dragged);
+
+    let mut new_val = current_progress.clamp(0.0, 1.0);
+    if let Some(pos) = response.interact_pointer_pos() {
+        if is_dragged || response.clicked() {
+            new_val = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        }
+    }
+
+    // Rail dimensions: spans 100% from rect.left() to rect.right()
+    let rail_height = if is_hovered || is_dragged { 8.0 } else { 6.0 };
+    let rail_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.center().y - rail_height / 2.0),
+        egui::pos2(rect.right(), rect.center().y + rail_height / 2.0),
+    );
+
+    // 1. Background rail (Visible gray spanning the full width)
+    let rail_bg = if is_hovered {
+        Color32::from_rgb(85, 85, 85)
+    } else {
+        Color32::from_rgb(65, 65, 65)
+    };
+    ui.painter().rect_filled(rail_rect, Rounding::same(rail_height / 2.0), rail_bg);
+    ui.painter().rect_stroke(rail_rect, Rounding::same(rail_height / 2.0), Stroke::new(1.0_f32, Color32::from_rgb(80, 80, 80)));
+
+    // 2. Trailing fill (YouTube RED up to current progress)
+    let fill_width = (rail_rect.width() * new_val).max(0.0);
+    let fill_rect = egui::Rect::from_min_max(
+        rail_rect.min,
+        egui::pos2(rail_rect.left() + fill_width, rail_rect.max.y),
+    );
+    ui.painter().rect_filled(fill_rect, Rounding::same(rail_height / 2.0), ACCENT);
+
+    // 3. Knob / Handle at current position
+    let knob_radius = if is_dragged {
+        8.0
+    } else if is_hovered {
+        7.0
+    } else {
+        5.5
+    };
+    let knob_center = egui::pos2(rail_rect.left() + fill_width, rect.center().y);
+    ui.painter().circle_filled(knob_center, knob_radius, Color32::WHITE);
+    if is_hovered || is_dragged {
+        ui.painter().circle_stroke(knob_center, knob_radius, Stroke::new(2.0_f32, ACCENT));
+    }
+
+    (is_dragged, is_drag_stopped, new_val)
 }
 
 fn thumb_placeholder(ui: &mut egui::Ui, size: Vec2) {

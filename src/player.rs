@@ -27,6 +27,9 @@ impl Player {
             .args([
                 "--idle=yes",
                 "--no-video",
+                "--vo=null",
+                "--no-audio-display",
+                "--force-window=no",
                 "--no-terminal",
                 "--quiet",
                 "--volume=70",
