@@ -748,7 +748,7 @@ impl YtMusicApp {
             .inner_margin(egui::Margin::symmetric(16.0, 10.0))
             .stroke(Stroke::new(1.0_f32, BORDER))
             .show(ui, |ui| {
-                ui.set_min_height(86.0);
+                ui.set_min_height(100.0);
 
                 if self.loading_stream {
                     ui.centered_and_justified(|ui| {
@@ -764,22 +764,28 @@ impl YtMusicApp {
                     return;
                 };
 
+                // ── Row 1: track info | centered controls | volume ───────────
+                let total_w  = ui.available_width();
+                let left_w   = 260.0_f32;
+                let right_w  = 170.0_f32;
+                let center_w = (total_w - left_w - right_w - 24.0).max(260.0);
+
                 ui.horizontal(|ui| {
-                    // ── Left: Track info + Favorite button (No thumbnail/video box) ──
+                    // ── Left: favorite heart + title/artist ──────────────────
                     ui.allocate_ui_with_layout(
-                        Vec2::new(210.0, ui.available_height()),
+                        Vec2::new(left_w, 48.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             let is_cur_fav = self.is_fav(&track.id);
                             if ui.add(
                                 egui::Button::new(
                                     RichText::new(if is_cur_fav { "❤" } else { "♡" })
-                                        .size(16.0)
+                                        .size(18.0)
                                         .color(if is_cur_fav { ACCENT } else { TEXT_M }),
                                 )
                                 .fill(Color32::TRANSPARENT)
                                 .stroke(Stroke::NONE)
-                                .min_size(Vec2::splat(28.0)),
+                                .min_size(Vec2::splat(30.0)),
                             ).on_hover_text(if is_cur_fav { "Favorilerden Çıkar" } else { "Favorilere Ekle" })
                             .clicked() {
                                 self.toggle_fav(track.clone());
@@ -788,7 +794,7 @@ impl YtMusicApp {
                             ui.add_space(4.0);
 
                             ui.vertical(|ui| {
-                                ui.set_width(175.0);
+                                ui.set_width(left_w - 48.0);
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(&track.title).color(TEXT).size(13.5).strong()
@@ -808,169 +814,168 @@ impl YtMusicApp {
                         },
                     );
 
-                    // ── Center: Centered controls & Ultra-Wide Progress Bar ────
-                    let right_width = 150.0;
-                    let available_for_center = (ui.available_width() - right_width - 16.0).max(200.0);
-
+                    // ── Center: ⏮ ▶/⏸ ⏭ 🔁 (centered) ───────────────────────
                     ui.allocate_ui_with_layout(
-                        Vec2::new(available_for_center, ui.available_height()),
-                        egui::Layout::top_down(egui::Align::Center),
+                        Vec2::new(center_w, 48.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            // Centered controls row
-                            ui.horizontal(|ui| {
-                                let ctrl_width = 175.0;
-                                let pad = (available_for_center - ctrl_width) / 2.0;
-                                ui.add_space(pad.max(0.0));
+                            let ctrl_width = 250.0;
+                            ui.add_space(((center_w - ctrl_width) / 2.0).max(0.0));
 
-                                // Previous
-                                let prev_en = self.queue_pos > 0 || self.position > 5.0;
-                                if ui.add_enabled(
-                                    prev_en,
-                                    egui::Button::new(
-                                        RichText::new("⏮").size(16.0).color(if prev_en { TEXT } else { TEXT_M })
-                                    )
-                                    .fill(Color32::TRANSPARENT)
+                            // Previous
+                            let prev_en = self.queue_pos > 0 || self.position > 5.0;
+                            if ui.add_enabled(
+                                prev_en,
+                                egui::Button::new(
+                                    RichText::new("⏮").size(18.0).color(if prev_en { TEXT } else { TEXT_M })
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE)
+                                .min_size(Vec2::new(36.0, 36.0)),
+                            ).on_hover_text("Önceki Şarkı")
+                            .clicked() {
+                                self.prev_track();
+                            }
+
+                            ui.add_space(6.0);
+
+                            // Play / Pause
+                            let icon = if self.playing { "⏸" } else { "▶" };
+                            if ui.add(
+                                egui::Button::new(RichText::new(icon).size(18.0).color(TEXT))
+                                    .fill(ACCENT)
+                                    .rounding(Rounding::same(21.0))
+                                    .min_size(Vec2::splat(42.0)),
+                            ).on_hover_text("Oynat / Duraklat (Boşluk Tuşu)")
+                            .clicked() {
+                                if let Some(p) = self.player.lock().unwrap().as_ref() {
+                                    let _ = p.toggle_pause();
+                                    self.playing = !self.playing;
+                                }
+                            }
+
+                            ui.add_space(6.0);
+
+                            // Next
+                            let next_en = self.queue_pos + 1 < self.queue.len();
+                            if ui.add_enabled(
+                                next_en,
+                                egui::Button::new(
+                                    RichText::new("⏭").size(18.0).color(if next_en { TEXT } else { TEXT_M })
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE)
+                                .min_size(Vec2::new(36.0, 36.0)),
+                            ).on_hover_text("Sonraki Şarkı")
+                            .clicked() {
+                                self.next_track();
+                            }
+
+                            ui.add_space(10.0);
+
+                            // Repeat mode toggle (bigger)
+                            let (rep_icon, rep_color, rep_bg, rep_tip) = match self.repeat_mode {
+                                RepeatMode::Off => ("🔁", TEXT_D, Color32::TRANSPARENT, "Tekrar: Kapalı (Sıradan Devam Et)"),
+                                RepeatMode::All => ("🔁", ACCENT, SURF2, "Tekrar: Tüm Listeyi Tekrarla"),
+                                RepeatMode::One => ("🔂", ACCENT, SURF2, "Tekrar: Bu Şarkıyı Tekrarla"),
+                            };
+                            if ui.add(
+                                egui::Button::new(RichText::new(rep_icon).size(24.0).color(rep_color))
+                                    .fill(rep_bg)
                                     .stroke(Stroke::NONE)
-                                    .min_size(Vec2::new(32.0, 32.0)),
-                                ).on_hover_text("Önceki Şarkı")
-                                .clicked() {
-                                    self.prev_track();
-                                }
-
-                                ui.add_space(6.0);
-
-                                // Play / Pause
-                                let icon = if self.playing { "⏸" } else { "▶" };
-                                if ui.add(
-                                    egui::Button::new(RichText::new(icon).size(17.0).color(TEXT))
-                                        .fill(ACCENT)
-                                        .rounding(Rounding::same(19.0))
-                                        .min_size(Vec2::splat(38.0)),
-                                ).on_hover_text("Oynat / Duraklat (Boşluk Tuşu)")
-                                .clicked() {
-                                    if let Some(p) = self.player.lock().unwrap().as_ref() {
-                                        let _ = p.toggle_pause();
-                                        self.playing = !self.playing;
-                                    }
-                                }
-
-                                ui.add_space(6.0);
-
-                                // Next
-                                let next_en = self.queue_pos + 1 < self.queue.len();
-                                if ui.add_enabled(
-                                    next_en,
-                                    egui::Button::new(
-                                        RichText::new("⏭").size(16.0).color(if next_en { TEXT } else { TEXT_M })
-                                    )
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::NONE)
-                                    .min_size(Vec2::new(32.0, 32.0)),
-                                ).on_hover_text("Sonraki Şarkı")
-                                .clicked() {
-                                    self.next_track();
-                                }
-
-                                ui.add_space(8.0);
-
-                                // Repeat mode toggle
-                                let (rep_icon, rep_color, rep_tip) = match self.repeat_mode {
-                                    RepeatMode::Off => ("🔁", TEXT_M, "Tekrar: Kapalı (Sıradan Devam Et)"),
-                                    RepeatMode::All => ("🔁", ACCENT, "Tekrar: Tüm Listeyi Tekrarla"),
-                                    RepeatMode::One => ("🔂", ACCENT, "Tekrar: Bu Şarkıyı Tekrarla"),
+                                    .rounding(Rounding::same(10.0))
+                                    .min_size(Vec2::new(46.0, 42.0)),
+                            ).on_hover_text(rep_tip)
+                            .clicked() {
+                                self.repeat_mode = match self.repeat_mode {
+                                    RepeatMode::Off => RepeatMode::All,
+                                    RepeatMode::All => RepeatMode::One,
+                                    RepeatMode::One => RepeatMode::Off,
                                 };
-                                if ui.add(
-                                    egui::Button::new(RichText::new(rep_icon).size(14.0).color(rep_color))
-                                        .fill(Color32::TRANSPARENT)
-                                        .stroke(Stroke::NONE)
-                                        .min_size(Vec2::new(28.0, 28.0)),
-                                ).on_hover_text(rep_tip)
-                                .clicked() {
-                                    self.repeat_mode = match self.repeat_mode {
-                                        RepeatMode::Off => RepeatMode::All,
-                                        RepeatMode::All => RepeatMode::One,
-                                        RepeatMode::One => RepeatMode::Off,
-                                    };
-                                }
+                            }
 
-                                if self.queue.len() > 1 {
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        RichText::new(format!("{}/{}", self.queue_pos + 1, self.queue.len()))
-                                            .color(TEXT_M)
-                                            .size(10.5)
-                                            .monospace(),
-                                    );
-                                }
-                            });
-
-                            ui.add_space(3.0);
-
-                            // Ultra-wide progress slider
-                            ui.horizontal(|ui| {
-                                let display = if self.user_seeking { self.seek_target } else { self.position };
-                                ui.label(RichText::new(fmt_time(display)).color(TEXT_D).size(11.0).monospace());
-
-                                ui.scope(|ui| {
-                                    ui.spacing_mut().slider_rail_height = 8.0;
-
-                                    let vis = ui.visuals_mut();
-                                    vis.widgets.inactive.bg_fill   = Color32::from_rgb(65, 65, 65);
-                                    vis.widgets.hovered.bg_fill    = Color32::from_rgb(85, 85, 85);
-                                    vis.widgets.active.bg_fill     = Color32::from_rgb(100, 100, 100);
-                                    vis.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(80, 80, 80));
-
-                                    let mut t = if self.duration > 0.0 {
-                                        (display / self.duration) as f32
-                                    } else { 0.0 };
-
-                                    let slider_w = (available_for_center - 90.0).max(120.0);
-                                    let r = ui.add_sized(
-                                        [slider_w, 20.0],
-                                        egui::Slider::new(&mut t, 0.0..=1.0)
-                                            .show_value(false)
-                                            .trailing_fill(true),
-                                    );
-
-                                    if r.dragged() {
-                                        self.user_seeking = true;
-                                        self.seek_target  = t as f64 * self.duration;
-                                    }
-                                    if r.drag_stopped() {
-                                        self.user_seeking = false;
-                                        if self.duration > 0.0 {
-                                            let target = t as f64 * self.duration;
-                                            if let Some(p) = self.player.lock().unwrap().as_ref() {
-                                                let _ = p.seek(target);
-                                            }
-                                            self.position = target;
-                                        }
-                                    }
-                                });
-
-                                ui.label(RichText::new(fmt_time(self.duration)).color(TEXT_D).size(11.0).monospace());
-                            });
+                            if self.queue.len() > 1 {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(format!("{}/{}", self.queue_pos + 1, self.queue.len()))
+                                        .color(TEXT_M)
+                                        .size(10.5)
+                                        .monospace(),
+                                );
+                            }
                         },
                     );
 
-                    // ── Right: Volume + percentage (docked to the right edge) ──
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let pct = self.volume.round() as u32;
-                        ui.label(RichText::new(format!("%{pct}")).color(TEXT_D).size(12.0).monospace());
+                    // ── Right: volume + percentage ───────────────────────────
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(right_w, 48.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let pct = self.volume.round() as u32;
+                            ui.label(RichText::new(format!("%{pct}")).color(TEXT_D).size(12.0).monospace());
 
+                            let r = ui.add_sized(
+                                [75.0, 18.0],
+                                egui::Slider::new(&mut self.volume, 0.0..=100.0).show_value(false),
+                            );
+                            if r.changed() {
+                                if let Some(p) = self.player.lock().unwrap().as_ref() {
+                                    let _ = p.set_volume(self.volume);
+                                }
+                            }
+
+                            let v_icon = if self.volume == 0.0 { "🔇" } else if self.volume < 50.0 { "🔉" } else { "🔊" };
+                            ui.label(RichText::new(v_icon).size(13.0).color(TEXT_D));
+                        },
+                    );
+                });
+
+                ui.add_space(4.0);
+
+                // ── Row 2: progress bar spanning the whole window width ──────
+                ui.horizontal(|ui| {
+                    let display = if self.user_seeking { self.seek_target } else { self.position };
+                    ui.label(RichText::new(fmt_time(display)).color(TEXT_D).size(11.0).monospace());
+
+                    ui.scope(|ui| {
+                        ui.spacing_mut().slider_rail_height = 8.0;
+
+                        let vis = ui.visuals_mut();
+                        vis.widgets.inactive.bg_fill   = Color32::from_rgb(65, 65, 65);
+                        vis.widgets.hovered.bg_fill    = Color32::from_rgb(85, 85, 85);
+                        vis.widgets.active.bg_fill     = Color32::from_rgb(100, 100, 100);
+                        vis.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(80, 80, 80));
+
+                        let mut t = if self.duration > 0.0 {
+                            (display / self.duration) as f32
+                        } else { 0.0 };
+
+                        // total_w minus the two time labels and item spacing
+                        let slider_w = (total_w - 100.0).max(120.0);
                         let r = ui.add_sized(
-                            [75.0, 18.0],
-                            egui::Slider::new(&mut self.volume, 0.0..=100.0).show_value(false),
+                            [slider_w, 22.0],
+                            egui::Slider::new(&mut t, 0.0..=1.0)
+                                .show_value(false)
+                                .trailing_fill(true),
                         );
-                        if r.changed() {
-                            if let Some(p) = self.player.lock().unwrap().as_ref() {
-                                let _ = p.set_volume(self.volume);
+
+                        if r.dragged() {
+                            self.user_seeking = true;
+                            self.seek_target  = t as f64 * self.duration;
+                        }
+                        if r.drag_stopped() {
+                            self.user_seeking = false;
+                            if self.duration > 0.0 {
+                                let target = t as f64 * self.duration;
+                                if let Some(p) = self.player.lock().unwrap().as_ref() {
+                                    let _ = p.seek(target);
+                                }
+                                self.position = target;
                             }
                         }
-
-                        let v_icon = if self.volume == 0.0 { "🔇" } else if self.volume < 50.0 { "🔉" } else { "🔊" };
-                        ui.label(RichText::new(v_icon).size(13.0).color(TEXT_D));
                     });
+
+                    ui.label(RichText::new(fmt_time(self.duration)).color(TEXT_D).size(11.0).monospace());
                 });
             });
     }
