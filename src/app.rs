@@ -474,7 +474,8 @@ impl YtMusicApp {
         ui.horizontal(|ui| {
             ui.set_min_height(52.0);
             ui.add_space(14.0);
-            ui.label(RichText::new("▶ YouTube Music").color(ACCENT).size(18.0).strong());
+            let app_title = format!("▶ YouTube Music v{}", env!("CARGO_PKG_VERSION"));
+            ui.label(RichText::new(app_title).color(ACCENT).size(18.0).strong());
 
             // Queue info (right side)
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
