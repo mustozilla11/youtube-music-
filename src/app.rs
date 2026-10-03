@@ -52,6 +52,7 @@ pub struct YtMusicApp {
     position: f64,
     duration: f64,
     volume: f64,
+    last_volume: f64,
     loading_stream: bool,
 
     // Seek UX: update visually while dragging, seek mpv only on release
@@ -182,6 +183,7 @@ impl YtMusicApp {
             position: 0.0,
             duration: 0.0,
             volume: 70.0,
+            last_volume: 70.0,
             loading_stream: false,
             user_seeking: false,
             seek_target: 0.0,
@@ -764,11 +766,10 @@ impl YtMusicApp {
                     return;
                 };
 
-                // ── Row 1: track info | centered controls | volume ───────────
-                let total_w  = ui.available_width();
-                let left_w   = 260.0_f32;
-                let right_w  = 170.0_f32;
-                let center_w = (total_w - left_w - right_w - 24.0).max(260.0);
+                // ── Row 1: track info (left) | unified player & volume controls ───────────
+                let total_w    = ui.available_width();
+                let left_w     = 260.0_f32;
+                let controls_w = (total_w - left_w - 16.0).max(280.0);
 
                 ui.horizontal(|ui| {
                     // ── Left: favorite heart + title/artist ──────────────────
@@ -814,13 +815,14 @@ impl YtMusicApp {
                         },
                     );
 
-                    // ── Center: ⏮ ▶/⏸ ⏭ 🔁 (centered) ───────────────────────
+                    // ── Player Controls: covers the area directly, unified with volume ───────
                     ui.allocate_ui_with_layout(
-                        Vec2::new(center_w, 48.0),
+                        Vec2::new(controls_w, 48.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            let ctrl_width = 250.0;
-                            ui.add_space(((center_w - ctrl_width) / 2.0).max(0.0));
+                            let group_w = 420.0;
+                            let pad = ((controls_w - group_w) / 2.0).max(0.0);
+                            ui.add_space(pad);
 
                             // Previous
                             let prev_en = self.queue_pos > 0 || self.position > 5.0;
@@ -873,18 +875,18 @@ impl YtMusicApp {
 
                             ui.add_space(10.0);
 
-                            // Repeat mode toggle (bigger)
+                            // Repeat mode toggle
                             let (rep_icon, rep_color, rep_bg, rep_tip) = match self.repeat_mode {
                                 RepeatMode::Off => ("🔁", TEXT_D, Color32::TRANSPARENT, "Tekrar: Kapalı (Sıradan Devam Et)"),
                                 RepeatMode::All => ("🔁", ACCENT, SURF2, "Tekrar: Tüm Listeyi Tekrarla"),
                                 RepeatMode::One => ("🔂", ACCENT, SURF2, "Tekrar: Bu Şarkıyı Tekrarla"),
                             };
                             if ui.add(
-                                egui::Button::new(RichText::new(rep_icon).size(24.0).color(rep_color))
+                                egui::Button::new(RichText::new(rep_icon).size(22.0).color(rep_color))
                                     .fill(rep_bg)
                                     .stroke(Stroke::NONE)
-                                    .rounding(Rounding::same(10.0))
-                                    .min_size(Vec2::new(46.0, 42.0)),
+                                    .rounding(Rounding::same(8.0))
+                                    .min_size(Vec2::new(42.0, 38.0)),
                             ).on_hover_text(rep_tip)
                             .clicked() {
                                 self.repeat_mode = match self.repeat_mode {
@@ -903,29 +905,43 @@ impl YtMusicApp {
                                         .monospace(),
                                 );
                             }
-                        },
-                    );
 
-                    // ── Right: volume + percentage ───────────────────────────
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(right_w, 48.0),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let pct = self.volume.round() as u32;
-                            ui.label(RichText::new(format!("%{pct}")).color(TEXT_D).size(12.0).monospace());
+                            ui.add_space(16.0);
 
-                            let r = ui.add_sized(
-                                [75.0, 18.0],
-                                egui::Slider::new(&mut self.volume, 0.0..=100.0).show_value(false),
-                            );
-                            if r.changed() {
+                            // Integrated Volume controls (Zero transparent boxes, custom clean rail)
+                            let v_icon = if self.volume == 0.0 { "🔇" } else if self.volume < 50.0 { "🔉" } else { "🔊" };
+                            let v_color = if self.volume == 0.0 { ACCENT } else { TEXT_D };
+                            if ui.add(
+                                egui::Button::new(RichText::new(v_icon).size(16.0).color(v_color))
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE)
+                                    .min_size(Vec2::splat(28.0)),
+                            ).on_hover_text("Sesi Kapat / Aç")
+                            .clicked() {
+                                if self.volume > 0.0 {
+                                    self.last_volume = self.volume;
+                                    self.volume = 0.0;
+                                } else {
+                                    self.volume = if self.last_volume > 0.0 { self.last_volume } else { 70.0 };
+                                }
                                 if let Some(p) = self.player.lock().unwrap().as_ref() {
                                     let _ = p.set_volume(self.volume);
                                 }
                             }
 
-                            let v_icon = if self.volume == 0.0 { "🔇" } else if self.volume < 50.0 { "🔉" } else { "🔊" };
-                            ui.label(RichText::new(v_icon).size(13.0).color(TEXT_D));
+                            ui.add_space(4.0);
+
+                            // Custom volume rail (NO egui slider frame, NO weird translucent box!)
+                            if draw_volume_bar(ui, &mut self.volume, 80.0) {
+                                if let Some(p) = self.player.lock().unwrap().as_ref() {
+                                    let _ = p.set_volume(self.volume);
+                                }
+                            }
+
+                            ui.add_space(6.0);
+
+                            let pct = self.volume.round() as u32;
+                            ui.label(RichText::new(format!("%{pct}")).color(TEXT_D).size(12.0).monospace());
                         },
                     );
                 });
@@ -1312,6 +1328,76 @@ fn draw_seek_bar(
     }
 
     (is_dragged, is_drag_stopped, new_val)
+}
+
+/// Custom volume bar that paints directly without egui's default slider box / transparent hover rect
+fn draw_volume_bar(
+    ui: &mut egui::Ui,
+    volume: &mut f64,
+    width: f32,
+) -> bool {
+    let desired_size = Vec2::new(width, 20.0);
+    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
+    let mut changed = false;
+
+    let is_hovered = response.hovered();
+    let is_dragged = response.dragged();
+
+    // Mouse wheel scroll to adjust volume when hovered
+    if is_hovered {
+        let scroll_y = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll_y > 0.0 {
+            *volume = (*volume + 5.0).min(100.0);
+            changed = true;
+        } else if scroll_y < 0.0 {
+            *volume = (*volume - 5.0).max(0.0);
+            changed = true;
+        }
+    }
+
+    if let Some(pos) = response.interact_pointer_pos() {
+        if is_dragged || response.clicked() {
+            let new_val = (((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) * 100.0) as f64;
+            if (new_val - *volume).abs() > 0.5 {
+                *volume = new_val;
+                changed = true;
+            }
+        }
+    }
+
+    // Rail dimensions
+    let rail_height = if is_hovered || is_dragged { 6.0 } else { 5.0 };
+    let rail_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.center().y - rail_height / 2.0),
+        egui::pos2(rect.right(), rect.center().y + rail_height / 2.0),
+    );
+
+    // 1. Gray rail background
+    let rail_bg = if is_hovered {
+        Color32::from_rgb(80, 80, 80)
+    } else {
+        Color32::from_rgb(55, 55, 55)
+    };
+    ui.painter().rect_filled(rail_rect, Rounding::same(rail_height / 2.0), rail_bg);
+
+    // 2. Trailing fill (YouTube RED)
+    let pct = (*volume as f32 / 100.0).clamp(0.0, 1.0);
+    let fill_width = rail_rect.width() * pct;
+    let fill_rect = egui::Rect::from_min_max(
+        rail_rect.min,
+        egui::pos2(rail_rect.left() + fill_width, rail_rect.max.y),
+    );
+    ui.painter().rect_filled(fill_rect, Rounding::same(rail_height / 2.0), ACCENT);
+
+    // 3. Knob / Handle at current volume
+    let knob_radius = if is_dragged { 6.0 } else if is_hovered { 5.5 } else { 4.0 };
+    let knob_center = egui::pos2(rail_rect.left() + fill_width, rect.center().y);
+    ui.painter().circle_filled(knob_center, knob_radius, Color32::WHITE);
+    if is_hovered || is_dragged {
+        ui.painter().circle_stroke(knob_center, knob_radius, Stroke::new(1.5_f32, ACCENT));
+    }
+
+    changed
 }
 
 fn thumb_placeholder(ui: &mut egui::Ui, size: Vec2) {
