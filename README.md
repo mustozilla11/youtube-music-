@@ -104,7 +104,7 @@ ytmusic-rs/
 
 ---
 
-## Gelecek Özellikler (Eklemek İstersen)
+## Gelecek Özellikler
 
 - [ ] Kuyruk / çalma listesi
 - [ ] Sonraki / önceki şarkı butonları
