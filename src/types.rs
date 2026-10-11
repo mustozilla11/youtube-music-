@@ -44,7 +44,9 @@ pub struct Config {
 
 pub enum WorkerMsg {
     Search(String),
-    GetStreamUrl(Track),
+    PlayTrack(Track),
+    NextTrack,
+    PrevTrack,
     LoadImage(String),
     FetchRadio(String),
     FetchYtHistory,
@@ -54,15 +56,8 @@ pub enum WorkerMsg {
 
 pub enum AppResult {
     SearchResults(Vec<Track>),
-    StreamUrlReady(String, Track),
+    TrackStarted(Track),
     ThumbnailLoaded(String, Vec<u8>),
-    PlayerState {
-        position: f64,
-        duration: f64,
-        paused: bool,
-        idle: bool,
-        eof: bool,
-    },
     RadioQueue(Vec<Track>),
     YtHistory(Vec<Track>),
     Error(String),

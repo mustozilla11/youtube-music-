@@ -27,6 +27,44 @@ enum RowAction {
     ToggleFav,
 }
 
+// ── Playback State (Shared between UI and background tasks) ─────────────────
+#[derive(Clone)]
+pub struct PlaybackState {
+    pub current: Option<Track>,
+    pub queue: Vec<Track>,
+    pub queue_pos: usize,
+    pub repeat_mode: RepeatMode,
+    pub playing: bool,
+    pub position: f64,
+    pub duration: f64,
+    pub volume: f64,
+    pub last_volume: f64,
+    pub loading_stream: bool,
+    pub radio_fetched: bool,
+    pub user_seeking: bool,
+    pub seek_target: f64,
+}
+
+impl Default for PlaybackState {
+    fn default() -> Self {
+        Self {
+            current: None,
+            queue: vec![],
+            queue_pos: 0,
+            repeat_mode: RepeatMode::Off,
+            playing: false,
+            position: 0.0,
+            duration: 0.0,
+            volume: 70.0,
+            last_volume: 70.0,
+            loading_stream: false,
+            radio_fetched: false,
+            user_seeking: false,
+            seek_target: 0.0,
+        }
+    }
+}
+
 // ── App state ────────────────────────────────────────────────────────────────
 pub struct YtMusicApp {
     tab: Tab,
@@ -40,28 +78,8 @@ pub struct YtMusicApp {
     history: Vec<Track>,
     favorites: Vec<Track>,
 
-    // Playback queue (YouTube Music automix 100-track list)
-    queue: Vec<Track>,
-    queue_pos: usize,
-    radio_fetched: bool,
-    repeat_mode: RepeatMode,
-
-    // Player state
-    current: Option<Track>,
-    playing: bool,
-    position: f64,
-    duration: f64,
-    volume: f64,
-    last_volume: f64,
-    loading_stream: bool,
-
-    // Seek UX: update visually while dragging, seek mpv only on release
-    user_seeking: bool,
-    seek_target: f64,
-
-    // State polling
-    polling: bool,
-    last_poll: Instant,
+    // Shared playback engine state (autonomous background audio)
+    playback: Arc<Mutex<PlaybackState>>,
 
     // Login
     login_open: bool,
@@ -87,6 +105,49 @@ pub struct YtMusicApp {
     img_pending: HashSet<String>,
 }
 
+async fn play_stream_async(
+    track: Track,
+    player: &Arc<Mutex<Option<Player>>>,
+    playback: &Arc<Mutex<PlaybackState>>,
+    tx: &mpsc::Sender<AppResult>,
+    egui_ctx: &egui::Context,
+) {
+    {
+        let mut ps = playback.lock().unwrap();
+        ps.loading_stream = true;
+        ps.position = 0.0;
+    }
+    egui_ctx.request_repaint();
+
+    match YtMusicClient::get_stream_url(&track.id).await {
+        Ok(url) => {
+            let guard = player.lock().unwrap();
+            if let Some(p) = guard.as_ref() {
+                let _ = p.load_url(&url);
+            }
+            drop(guard);
+
+            {
+                let mut ps = playback.lock().unwrap();
+                ps.current = Some(track.clone());
+                ps.playing = true;
+                ps.loading_stream = false;
+                ps.position = 0.0;
+            }
+            let _ = tx.send(AppResult::TrackStarted(track));
+            egui_ctx.request_repaint();
+        }
+        Err(e) => {
+            {
+                let mut ps = playback.lock().unwrap();
+                ps.loading_stream = false;
+            }
+            let _ = tx.send(AppResult::Error(format!("Şarkı açılamadı: {e}")));
+            egui_ctx.request_repaint();
+        }
+    }
+}
+
 impl YtMusicApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<tokio::runtime::Runtime>) -> Self {
         let storage = Storage::new().expect("storage init");
@@ -107,10 +168,16 @@ impl YtMusicApp {
             let _ = cmd_tx.send(WorkerMsg::FetchYtHistory);
         }
 
+        let playback = Arc::new(Mutex::new(PlaybackState::default()));
+
         // ── Background worker ────────────────────────────────────────────────
         {
-            let tx     = res_tx.clone();
-            let cookie = config.cookie.clone();
+            let tx       = res_tx.clone();
+            let cookie   = config.cookie.clone();
+            let player   = player.clone();
+            let playback = playback.clone();
+            let egui_ctx = _cc.egui_ctx.clone();
+
             rt.spawn(async move {
                 let api = match YtMusicClient::new(cookie) {
                     Ok(a) => a,
@@ -130,12 +197,101 @@ impl YtMusicApp {
                             };
                             let _ = tx.send(r);
                         }
-                        WorkerMsg::GetStreamUrl(track) => {
-                            let r = match YtMusicClient::get_stream_url(&track.id).await {
-                                Ok(u) => AppResult::StreamUrlReady(u, track),
-                                Err(e) => AppResult::Error(e.to_string()),
+                        WorkerMsg::PlayTrack(track) => {
+                            {
+                                let mut ps = playback.lock().unwrap();
+                                let pos = ps.queue.iter().position(|t| t.id == track.id);
+                                if let Some(p) = pos {
+                                    ps.queue_pos = p;
+                                } else {
+                                    ps.queue = vec![track.clone()];
+                                    ps.queue_pos = 0;
+                                    ps.radio_fetched = false;
+                                }
+                            }
+                            play_stream_async(track.clone(), &player, &playback, &tx, &egui_ctx).await;
+
+                            let need_radio = {
+                                let mut ps = playback.lock().unwrap();
+                                if !ps.radio_fetched {
+                                    ps.radio_fetched = true;
+                                    true
+                                } else {
+                                    false
+                                }
                             };
-                            let _ = tx.send(r);
+                            if need_radio {
+                                if let Ok(tracks) = api.get_radio_queue(&track.id).await {
+                                    if !tracks.is_empty() {
+                                        let mut ps = playback.lock().unwrap();
+                                        let cur_id = ps.current.as_ref().map(|t| t.id.clone());
+                                        ps.queue = tracks.clone();
+                                        if let Some(id) = cur_id {
+                                            ps.queue_pos = ps.queue.iter().position(|t| t.id == id).unwrap_or(0);
+                                        } else {
+                                            ps.queue_pos = 0;
+                                        }
+                                        drop(ps);
+                                        let _ = tx.send(AppResult::RadioQueue(tracks));
+                                        egui_ctx.request_repaint();
+                                    }
+                                }
+                            }
+                        }
+                        WorkerMsg::NextTrack => {
+                            let next_track = {
+                                let mut ps = playback.lock().unwrap();
+                                if ps.loading_stream {
+                                    None
+                                } else {
+                                    match ps.repeat_mode {
+                                        RepeatMode::One => ps.current.clone(),
+                                        RepeatMode::All => {
+                                            if !ps.queue.is_empty() {
+                                                ps.queue_pos = (ps.queue_pos + 1) % ps.queue.len();
+                                                Some(ps.queue[ps.queue_pos].clone())
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        RepeatMode::Off => {
+                                            let next = ps.queue_pos + 1;
+                                            if next < ps.queue.len() {
+                                                ps.queue_pos = next;
+                                                Some(ps.queue[next].clone())
+                                            } else {
+                                                ps.playing = false;
+                                                None
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                            if let Some(t) = next_track {
+                                play_stream_async(t, &player, &playback, &tx, &egui_ctx).await;
+                            }
+                        }
+                        WorkerMsg::PrevTrack => {
+                            let prev_track = {
+                                let mut ps = playback.lock().unwrap();
+                                if ps.loading_stream {
+                                    None
+                                } else if ps.position > 5.0 {
+                                    if let Some(p) = player.lock().unwrap().as_ref() {
+                                        let _ = p.seek(0.0);
+                                    }
+                                    ps.position = 0.0;
+                                    None
+                                } else if ps.queue_pos > 0 {
+                                    ps.queue_pos -= 1;
+                                    Some(ps.queue[ps.queue_pos].clone())
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(t) = prev_track {
+                                play_stream_async(t, &player, &playback, &tx, &egui_ctx).await;
+                            }
                         }
                         WorkerMsg::LoadImage(url) => {
                             if let Ok(resp) = reqwest::get(&url).await {
@@ -147,7 +303,17 @@ impl YtMusicApp {
                         WorkerMsg::FetchRadio(vid) => {
                             match api.get_radio_queue(&vid).await {
                                 Ok(tracks) if !tracks.is_empty() => {
+                                    let mut ps = playback.lock().unwrap();
+                                    let cur_id = ps.current.as_ref().map(|t| t.id.clone());
+                                    ps.queue = tracks.clone();
+                                    if let Some(id) = cur_id {
+                                        ps.queue_pos = ps.queue.iter().position(|t| t.id == id).unwrap_or(0);
+                                    } else {
+                                        ps.queue_pos = 0;
+                                    }
+                                    drop(ps);
                                     let _ = tx.send(AppResult::RadioQueue(tracks));
+                                    egui_ctx.request_repaint();
                                 }
                                 Err(e) => {
                                     eprintln!("[ytmusic] radio queue hatası: {e}");
@@ -167,6 +333,52 @@ impl YtMusicApp {
             });
         }
 
+        // ── Autonomous background playback monitor (runs continuously regardless of window state) ──
+        {
+            let player   = player.clone();
+            let playback = playback.clone();
+            let cmd_tx   = cmd_tx.clone();
+            let egui_ctx = _cc.egui_ctx.clone();
+
+            rt.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(300));
+                loop {
+                    interval.tick().await;
+
+                    let state = tokio::task::spawn_blocking({
+                        let player = player.clone();
+                        move || player.lock().ok()?.as_ref().map(|p| p.get_state())
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+
+                    if let Some((pos, dur, paused, idle, eof)) = state {
+                        let mut ps = playback.lock().unwrap();
+                        if !ps.user_seeking {
+                            ps.position = pos;
+                            ps.duration = dur;
+                        } else {
+                            ps.duration = dur;
+                        }
+                        ps.playing = !paused && !idle;
+
+                        let track_ended = ps.current.is_some()
+                            && !ps.loading_stream
+                            && (eof || (idle && pos > 3.0));
+
+                        drop(ps);
+
+                        if track_ended {
+                            let _ = cmd_tx.send(WorkerMsg::NextTrack);
+                        }
+
+                        egui_ctx.request_repaint();
+                    }
+                }
+            });
+        }
+
         Self {
             tab: Tab::Search,
             query: String::new(),
@@ -174,21 +386,7 @@ impl YtMusicApp {
             results: vec![],
             history,
             favorites,
-            queue: vec![],
-            queue_pos: 0,
-            radio_fetched: false,
-            repeat_mode: RepeatMode::Off,
-            current: None,
-            playing: false,
-            position: 0.0,
-            duration: 0.0,
-            volume: 70.0,
-            last_volume: 70.0,
-            loading_stream: false,
-            user_seeking: false,
-            seek_target: 0.0,
-            polling: false,
-            last_poll: Instant::now(),
+            playback,
             login_open: false,
             cookie_buf: String::new(),
             config,
@@ -259,34 +457,14 @@ impl YtMusicApp {
                     self.searching = false;
                 }
 
-                AppResult::StreamUrlReady(url, track) => {
-                    self.loading_stream = false;
-                    let guard = self.player.lock().unwrap();
-                    if let Some(p) = guard.as_ref() {
-                        match p.load_url(&url) {
-                            Ok(_) => {
-                                drop(guard);
-                                // History
-                                self.history.retain(|t| t.id != track.id);
-                                self.history.insert(0, track.clone());
-                                self.history.truncate(50);
-                                self.storage.save_history(&self.history);
+                AppResult::TrackStarted(track) => {
+                    self.history.retain(|t| t.id != track.id);
+                    self.history.insert(0, track.clone());
+                    self.history.truncate(50);
+                    self.storage.save_history(&self.history);
 
-                                self.current  = Some(track.clone());
-                                self.playing  = true;
-                                self.position = 0.0;
-
-                                // Auto-fetch YouTube Music automix/radio playlist
-                                if !self.radio_fetched {
-                                    self.radio_fetched = true;
-                                    let _ = self.cmd_tx.send(WorkerMsg::FetchRadio(track.id));
-                                }
-                            }
-                            Err(e) => {
-                                drop(guard);
-                                self.toast(e.to_string());
-                            }
-                        }
+                    if let Some(url) = &track.thumbnail_url {
+                        self.queue_img(url);
                     }
                 }
 
@@ -303,41 +481,8 @@ impl YtMusicApp {
                     }
                 }
 
-                AppResult::PlayerState { position, duration, paused, idle, eof } => {
-                    self.polling = false;
-
-                    // Reliable end-of-track detection:
-                    // If mpv reached EOF or went back to idle while we were playing (and not currently loading a new track)
-                    let track_ended = self.current.is_some()
-                        && self.playing
-                        && !self.loading_stream
-                        && (eof || (idle && self.position > 3.0));
-
-                    if !self.user_seeking {
-                        self.position = position;
-                        self.duration = duration;
-                    } else {
-                        self.duration = duration;
-                    }
-                    self.playing = !paused && !idle;
-
-                    if track_ended {
-                        self.auto_next();
-                    }
-                }
-
                 AppResult::RadioQueue(tracks) => {
-                    if !tracks.is_empty() {
-                        let cur_id = self.current.as_ref().map(|t| t.id.clone());
-                        self.queue = tracks;
-                        if let Some(id) = cur_id {
-                            self.queue_pos = self.queue.iter().position(|t| t.id == id).unwrap_or(0);
-                        } else {
-                            self.queue_pos = 0;
-                        }
-                        let prefetch_list = self.queue.clone();
-                        self.prefetch_thumbs(&prefetch_list);
-                    }
+                    self.prefetch_thumbs(&tracks);
                 }
 
                 AppResult::YtHistory(tracks) => {
@@ -346,114 +491,23 @@ impl YtMusicApp {
                 }
 
                 AppResult::Error(e) => {
-                    self.searching      = false;
-                    self.loading_stream = false;
-                    self.polling        = false;
+                    self.searching = false;
                     self.toast(e);
                 }
             }
         }
     }
 
-    // ── mpv state polling ────────────────────────────────────────────────────
-    fn poll_player(&mut self) {
-        if self.polling
-            || self.current.is_none()
-            || self.last_poll.elapsed() < Duration::from_millis(600)
-        {
-            return;
-        }
-        self.polling   = true;
-        self.last_poll = Instant::now();
-
-        let player = self.player.clone();
-        let tx     = self.res_tx.clone();
-        self.rt.spawn(async move {
-            let state = tokio::task::spawn_blocking(move || {
-                player.lock().ok()?.as_ref().map(|p| p.get_state())
-            })
-            .await
-            .ok()
-            .flatten();
-
-            if let Some((pos, dur, paused, idle, eof)) = state {
-                let _ = tx.send(AppResult::PlayerState { position: pos, duration: dur, paused, idle, eof });
-            } else {
-                let _ = tx.send(AppResult::PlayerState {
-                    position: 0.0,
-                    duration: 0.0,
-                    paused:   true,
-                    idle:     true,
-                    eof:      false,
-                });
-            }
-        });
-    }
-
-    /// Automatically advance to the next track in the automix queue
-    fn auto_next(&mut self) {
-        if self.loading_stream {
-            return;
-        }
-        match self.repeat_mode {
-            RepeatMode::One => {
-                if let Some(track) = self.current.clone() {
-                    self.do_play(track);
-                }
-            }
-            RepeatMode::All => {
-                if !self.queue.is_empty() {
-                    self.queue_pos = (self.queue_pos + 1) % self.queue.len();
-                    let track = self.queue[self.queue_pos].clone();
-                    self.do_play(track);
-                }
-            }
-            RepeatMode::Off => {
-                let next = self.queue_pos + 1;
-                if next < self.queue.len() {
-                    self.queue_pos = next;
-                    let track = self.queue[next].clone();
-                    self.do_play(track);
-                } else {
-                    self.playing = false;
-                }
-            }
-        }
-    }
-
     fn next_track(&mut self) {
-        self.auto_next();
+        let _ = self.cmd_tx.send(WorkerMsg::NextTrack);
     }
 
     fn prev_track(&mut self) {
-        // If > 5 seconds in, restart track; otherwise go to previous track in queue
-        if self.position > 5.0 {
-            if let Some(p) = self.player.lock().unwrap().as_ref() {
-                let _ = p.seek(0.0);
-            }
-            self.position = 0.0;
-        } else if self.queue_pos > 0 {
-            self.queue_pos -= 1;
-            let track = self.queue[self.queue_pos].clone();
-            self.do_play(track);
-        }
+        let _ = self.cmd_tx.send(WorkerMsg::PrevTrack);
     }
 
     fn play_track(&mut self, track: Track) {
-        self.queue.clear();
-        self.queue.push(track.clone());
-        self.queue_pos     = 0;
-        self.radio_fetched = false;
-        self.do_play(track);
-    }
-
-    /// Internal: start loading the stream without resetting the queue
-    fn do_play(&mut self, track: Track) {
-        if self.loading_stream { return; }
-        self.loading_stream = true;
-        self.position       = 0.0;
-        if let Some(url) = &track.thumbnail_url { self.queue_img(url); }
-        let _ = self.cmd_tx.send(WorkerMsg::GetStreamUrl(track));
+        let _ = self.cmd_tx.send(WorkerMsg::PlayTrack(track));
     }
 
     // ── Misc helpers ─────────────────────────────────────────────────────────
@@ -522,10 +576,14 @@ impl YtMusicApp {
                     self.cookie_buf = self.config.cookie.clone().unwrap_or_default();
                 }
 
-                if self.queue.len() > 1 {
+                let (q_len, q_pos) = {
+                    let ps = self.playback.lock().unwrap();
+                    (ps.queue.len(), ps.queue_pos)
+                };
+                if q_len > 1 {
                     ui.add_space(10.0);
                     ui.label(
-                        RichText::new(format!("Kuyruk: {}/{}", self.queue_pos + 1, self.queue.len()))
+                        RichText::new(format!("Kuyruk: {}/{}", q_pos + 1, q_len))
                             .color(TEXT_M)
                             .size(11.5),
                     );
@@ -539,8 +597,9 @@ impl YtMusicApp {
             ui.set_min_height(42.0);
             ui.add_space(14.0);
 
-            let queue_label = if self.queue.len() > 1 {
-                format!("📻  Sıradaki ({})", self.queue.len())
+            let q_len = self.playback.lock().unwrap().queue.len();
+            let queue_label = if q_len > 1 {
+                format!("📻  Sıradaki ({q_len})")
             } else {
                 "📻  Sıradaki".to_string()
             };
@@ -612,9 +671,11 @@ impl YtMusicApp {
         self.prefetch_thumbs(&results);
 
         let textures = self.textures.clone();
-        let current  = self.current.clone();
+        let (current, playing) = {
+            let ps = self.playback.lock().unwrap();
+            (ps.current.clone(), ps.playing)
+        };
         let favs     = self.favorites.clone();
-        let playing  = self.playing;
         let mut actions: Vec<(Track, RowAction)> = vec![];
 
         egui::ScrollArea::vertical().id_source("search_scroll").show(ui, |ui| {
@@ -641,13 +702,14 @@ impl YtMusicApp {
     }
 
     fn ui_queue_tab(&mut self, ui: &mut egui::Ui) {
-        let queue = self.queue.clone();
+        let (queue, queue_pos, playing) = {
+            let ps = self.playback.lock().unwrap();
+            (ps.queue.clone(), ps.queue_pos, ps.playing)
+        };
         self.prefetch_thumbs(&queue);
 
         let textures  = self.textures.clone();
         let favs      = self.favorites.clone();
-        let playing   = self.playing;
-        let queue_pos = self.queue_pos;
         let mut actions: Vec<(usize, Track, RowAction)> = vec![];
 
         egui::ScrollArea::vertical().id_source("queue_scroll").show(ui, |ui| {
@@ -683,11 +745,10 @@ impl YtMusicApp {
             }
         });
 
-        for (idx, track, a) in actions {
+        for (_idx, track, a) in actions {
             match a {
                 RowAction::Play => {
-                    self.queue_pos = idx;
-                    self.do_play(track);
+                    self.play_track(track);
                 }
                 RowAction::ToggleFav => self.toggle_fav(track),
             }
@@ -703,9 +764,11 @@ impl YtMusicApp {
         self.prefetch_thumbs(&source);
 
         let textures = self.textures.clone();
-        let current  = self.current.clone();
+        let (current, playing) = {
+            let ps = self.playback.lock().unwrap();
+            (ps.current.clone(), ps.playing)
+        };
         let favs     = self.favorites.clone();
-        let playing  = self.playing;
         let mut actions: Vec<(Track, RowAction)> = vec![];
 
         egui::ScrollArea::vertical().id_source(title).show(ui, |ui| {
@@ -745,6 +808,35 @@ impl YtMusicApp {
     }
 
     fn ui_player_bar(&mut self, ui: &mut egui::Ui) {
+        let (
+            track,
+            loading_stream,
+            playing,
+            position,
+            duration,
+            volume,
+            queue_pos,
+            queue_len,
+            repeat_mode,
+            user_seeking,
+            seek_target,
+        ) = {
+            let ps = self.playback.lock().unwrap();
+            (
+                ps.current.clone(),
+                ps.loading_stream,
+                ps.playing,
+                ps.position,
+                ps.duration,
+                ps.volume,
+                ps.queue_pos,
+                ps.queue.len(),
+                ps.repeat_mode,
+                ps.user_seeking,
+                ps.seek_target,
+            )
+        };
+
         egui::Frame::none()
             .fill(Color32::from_gray(6))
             .inner_margin(egui::Margin::symmetric(16.0, 10.0))
@@ -752,14 +844,14 @@ impl YtMusicApp {
             .show(ui, |ui| {
                 ui.set_min_height(100.0);
 
-                if self.loading_stream {
+                if loading_stream {
                     ui.centered_and_justified(|ui| {
                         ui.label(RichText::new("⏳  Yükleniyor…").color(TEXT_D).size(14.0));
                     });
                     return;
                 }
 
-                let Some(track) = self.current.clone() else {
+                let Some(track) = track else {
                     ui.centered_and_justified(|ui| {
                         ui.label(RichText::new("♪  Çalmak için bir şarkı seç").color(TEXT_M).size(13.5));
                     });
@@ -825,7 +917,7 @@ impl YtMusicApp {
                             ui.add_space(pad);
 
                             // Previous
-                            let prev_en = self.queue_pos > 0 || self.position > 5.0;
+                            let prev_en = queue_pos > 0 || position > 5.0;
                             if ui.add_enabled(
                                 prev_en,
                                 egui::Button::new(
@@ -842,7 +934,7 @@ impl YtMusicApp {
                             ui.add_space(6.0);
 
                             // Play / Pause
-                            let icon = if self.playing { "⏸" } else { "▶" };
+                            let icon = if playing { "⏸" } else { "▶" };
                             if ui.add(
                                 egui::Button::new(RichText::new(icon).size(18.0).color(TEXT))
                                     .fill(ACCENT)
@@ -852,14 +944,15 @@ impl YtMusicApp {
                             .clicked() {
                                 if let Some(p) = self.player.lock().unwrap().as_ref() {
                                     let _ = p.toggle_pause();
-                                    self.playing = !self.playing;
+                                    let mut ps = self.playback.lock().unwrap();
+                                    ps.playing = !ps.playing;
                                 }
                             }
 
                             ui.add_space(6.0);
 
                             // Next
-                            let next_en = self.queue_pos + 1 < self.queue.len();
+                            let next_en = queue_pos + 1 < queue_len;
                             if ui.add_enabled(
                                 next_en,
                                 egui::Button::new(
@@ -876,7 +969,7 @@ impl YtMusicApp {
                             ui.add_space(10.0);
 
                             // Repeat mode toggle
-                            let (rep_icon, rep_color, rep_bg, rep_tip) = match self.repeat_mode {
+                            let (rep_icon, rep_color, rep_bg, rep_tip) = match repeat_mode {
                                 RepeatMode::Off => ("🔁", TEXT_D, Color32::TRANSPARENT, "Tekrar: Kapalı (Sıradan Devam Et)"),
                                 RepeatMode::All => ("🔁", ACCENT, SURF2, "Tekrar: Tüm Listeyi Tekrarla"),
                                 RepeatMode::One => ("🔂", ACCENT, SURF2, "Tekrar: Bu Şarkıyı Tekrarla"),
@@ -889,17 +982,18 @@ impl YtMusicApp {
                                     .min_size(Vec2::new(42.0, 38.0)),
                             ).on_hover_text(rep_tip)
                             .clicked() {
-                                self.repeat_mode = match self.repeat_mode {
+                                let mut ps = self.playback.lock().unwrap();
+                                ps.repeat_mode = match ps.repeat_mode {
                                     RepeatMode::Off => RepeatMode::All,
                                     RepeatMode::All => RepeatMode::One,
                                     RepeatMode::One => RepeatMode::Off,
                                 };
                             }
 
-                            if self.queue.len() > 1 {
+                            if queue_len > 1 {
                                 ui.add_space(6.0);
                                 ui.label(
-                                    RichText::new(format!("{}/{}", self.queue_pos + 1, self.queue.len()))
+                                    RichText::new(format!("{}/{}", queue_pos + 1, queue_len))
                                         .color(TEXT_M)
                                         .size(10.5)
                                         .monospace(),
@@ -909,8 +1003,8 @@ impl YtMusicApp {
                             ui.add_space(16.0);
 
                             // Integrated Volume controls (Zero transparent boxes, custom clean rail)
-                            let v_icon = if self.volume == 0.0 { "🔇" } else if self.volume < 50.0 { "🔉" } else { "🔊" };
-                            let v_color = if self.volume == 0.0 { ACCENT } else { TEXT_D };
+                            let v_icon = if volume == 0.0 { "🔇" } else if volume < 50.0 { "🔉" } else { "🔊" };
+                            let v_color = if volume == 0.0 { ACCENT } else { TEXT_D };
                             if ui.add(
                                 egui::Button::new(RichText::new(v_icon).size(16.0).color(v_color))
                                     .fill(Color32::TRANSPARENT)
@@ -918,29 +1012,34 @@ impl YtMusicApp {
                                     .min_size(Vec2::splat(28.0)),
                             ).on_hover_text("Sesi Kapat / Aç")
                             .clicked() {
-                                if self.volume > 0.0 {
-                                    self.last_volume = self.volume;
-                                    self.volume = 0.0;
+                                let mut ps = self.playback.lock().unwrap();
+                                if ps.volume > 0.0 {
+                                    ps.last_volume = ps.volume;
+                                    ps.volume = 0.0;
                                 } else {
-                                    self.volume = if self.last_volume > 0.0 { self.last_volume } else { 70.0 };
+                                    ps.volume = if ps.last_volume > 0.0 { ps.last_volume } else { 70.0 };
                                 }
+                                let new_vol = ps.volume;
+                                drop(ps);
                                 if let Some(p) = self.player.lock().unwrap().as_ref() {
-                                    let _ = p.set_volume(self.volume);
+                                    let _ = p.set_volume(new_vol);
                                 }
                             }
 
                             ui.add_space(4.0);
 
                             // Custom volume rail (NO egui slider frame, NO weird translucent box!)
-                            if draw_volume_bar(ui, &mut self.volume, 80.0) {
+                            let mut vol = volume;
+                            if draw_volume_bar(ui, &mut vol, 80.0) {
                                 if let Some(p) = self.player.lock().unwrap().as_ref() {
-                                    let _ = p.set_volume(self.volume);
+                                    let _ = p.set_volume(vol);
                                 }
+                                self.playback.lock().unwrap().volume = vol;
                             }
 
                             ui.add_space(6.0);
 
-                            let pct = self.volume.round() as u32;
+                            let pct = volume.round() as u32;
                             ui.label(RichText::new(format!("%{pct}")).color(TEXT_D).size(12.0).monospace());
                         },
                     );
@@ -950,11 +1049,11 @@ impl YtMusicApp {
 
                 // ── Row 2: progress bar spanning the whole window width ──────
                 ui.horizontal(|ui| {
-                    let display = if self.user_seeking { self.seek_target } else { self.position };
+                    let display = if user_seeking { seek_target } else { position };
                     ui.label(RichText::new(fmt_time(display)).color(TEXT_D).size(11.0).monospace());
 
-                    let progress = if self.duration > 0.0 {
-                        (display / self.duration) as f32
+                    let progress = if duration > 0.0 {
+                        (display / duration) as f32
                     } else {
                         0.0
                     };
@@ -963,21 +1062,23 @@ impl YtMusicApp {
                     let (is_dragged, is_drag_stopped, new_val) = draw_seek_bar(ui, progress, slider_w);
 
                     if is_dragged {
-                        self.user_seeking = true;
-                        self.seek_target  = new_val as f64 * self.duration;
+                        let mut ps = self.playback.lock().unwrap();
+                        ps.user_seeking = true;
+                        ps.seek_target  = new_val as f64 * duration;
                     }
                     if is_drag_stopped {
-                        self.user_seeking = false;
-                        if self.duration > 0.0 {
-                            let target = new_val as f64 * self.duration;
+                        let mut ps = self.playback.lock().unwrap();
+                        ps.user_seeking = false;
+                        if duration > 0.0 {
+                            let target = new_val as f64 * duration;
                             if let Some(p) = self.player.lock().unwrap().as_ref() {
                                 let _ = p.seek(target);
                             }
-                            self.position = target;
+                            ps.position = target;
                         }
                     }
 
-                    ui.label(RichText::new(fmt_time(self.duration)).color(TEXT_D).size(11.0).monospace());
+                    ui.label(RichText::new(fmt_time(duration)).color(TEXT_D).size(11.0).monospace());
                 });
             });
     }
@@ -1419,13 +1520,13 @@ impl eframe::App for YtMusicApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         Self::apply_theme(ctx);
         self.drain(ctx);
-        self.poll_player();
 
         // Spacebar toggles playback (unless user is typing in a search text box)
         if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             if let Some(p) = self.player.lock().unwrap().as_ref() {
                 let _ = p.toggle_pause();
-                self.playing = !self.playing;
+                let mut ps = self.playback.lock().unwrap();
+                ps.playing = !ps.playing;
             }
         }
 
@@ -1434,8 +1535,9 @@ impl eframe::App for YtMusicApp {
         }
 
         // Keep repainting while playing for progress bar smoothness
-        if self.playing {
-            ctx.request_repaint_after(Duration::from_millis(600));
+        let is_playing = self.playback.lock().unwrap().playing;
+        if is_playing {
+            ctx.request_repaint_after(Duration::from_millis(300));
         }
 
         egui::TopBottomPanel::top("top")
